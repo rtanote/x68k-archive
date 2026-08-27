@@ -13,7 +13,7 @@ clap.workspace = true
 encoding_rs.workspace = true
 
 # tantivy: 全文索引エンジン (Pure Rust)
-tantivy = "0.22"
+tantivy = "0.26"
 
 # 内容ハッシュ (image_id) と JSON (summary cache) 用 (Phase 4 で使うが先に追加)
 sha1 = "0.10"
