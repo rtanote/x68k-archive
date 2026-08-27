@@ -1,0 +1,43 @@
+# 依存の更新を Dependabot に任せる設定。
+#
+# セキュリティ更新 (脆弱性が出たときの緊急 PR) はリポジトリ設定側で有効化済みで、
+# ここの設定とは独立に動く。このファイルが担当するのは定期的なバージョン更新のほう。
+#
+# 個人プロジェクトなので PR が溢れないよう、
+#   - 頻度は monthly
+#   - minor / patch はまとめて 1 PR (groups)
+#   - major は個別 PR (破壊的変更のレビューが要るため)
+# としている。
+version: 2
+updates:
+  # ---- Rust の依存 ----
+  #
+  # 注意: png2pic は git 依存 (rev 固定) なので Dependabot の対象外。
+  # 更新したいときは crates/xdf-mcp/Cargo.toml の rev を手で張り替えること。
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ---- GitHub Actions ----
+  #
+  # actions/checkout や dtolnay/rust-toolchain 等のバージョン追随。
+  # 数が少なく更新頻度も低いので全部まとめて 1 PR にする。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns:
+          - "*"
