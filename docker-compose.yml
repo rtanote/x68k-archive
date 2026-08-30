@@ -45,6 +45,12 @@ services:
       # 例: .env に XDF_MCP_ALLOWED_HOSTS=myhost.your-tailnet.ts.net を設定。
       # デフォルトの localhost / 127.0.0.1 / ::1 は常に許可される。
       - XDF_MCP_ALLOWED_HOSTS=${XDF_MCP_ALLOWED_HOSTS:-}
+      # Streamable HTTP を stateful (セッション) モードにする。既定は stateless。
+      # stateful ではセッションがプロセスのメモリ上にしか無く、コンテナを再起動すると
+      # 全消えする。古い Mcp-Session-Id を持つクライアントには 404 が返り続け、
+      # 「接続はできているのにツール呼び出しだけ全部失敗する」状態になるため、
+      # 恒久運用では有効にしないこと。
+      - XDF_MCP_STATEFUL=${XDF_MCP_STATEFUL:-}
       # Bearer token 認証 (Tailscale Funnel 等で公開する場合に必須)。
       # 空なら認証なし。設定時はリクエストに `Authorization: Bearer <token>` 必須。
       # トークン生成例: openssl rand -hex 32
