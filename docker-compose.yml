@@ -50,7 +50,8 @@ services:
       # 全消えする。古い Mcp-Session-Id を持つクライアントには 404 が返り続け、
       # 「接続はできているのにツール呼び出しだけ全部失敗する」状態になるため、
       # 恒久運用では有効にしないこと。
-      - XDF_MCP_STATEFUL=${XDF_MCP_STATEFUL:-}
+      # 空文字を渡すと clap が bool として解釈できず起動に失敗するため、既定値を明示する
+      - XDF_MCP_STATEFUL=${XDF_MCP_STATEFUL:-false}
       # Bearer token 認証 (Tailscale Funnel 等で公開する場合に必須)。
       # 空なら認証なし。設定時はリクエストに `Authorization: Bearer <token>` 必須。
       # トークン生成例: openssl rand -hex 32
