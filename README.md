@@ -233,6 +233,7 @@ HDD/フロッピー差分を吸収できるヘルパも提供。
 | `XDF_MCP_PUBLIC_URL` | xdf-mcp | (空) | `download_url` 組立用の公開 URL prefix |
 | `XDF_MCP_EXTRACT_DIR` | xdf-mcp | OS の一時ディレクトリ | ZIP の書き出し先 |
 | `XDF_MCP_NO_HOST_CHECK` | xdf-mcp | `false` | Host 検証の無効化 (デバッグ用) |
+| `XDF_MCP_STATEFUL` | xdf-mcp | `false` | Streamable HTTP を stateful (セッション) モードにする |
 
 すべて対応する CLI フラグ (`--http-path` 等) でも指定できる。
 

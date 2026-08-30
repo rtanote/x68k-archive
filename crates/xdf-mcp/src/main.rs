@@ -15,9 +15,11 @@ use clap::Parser;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolResult, Content, Implementation, InitializeRequestParams, ProtocolVersion,
+        ServerCapabilities, ServerInfo,
     },
     schemars,
+    service::RequestContext,
     tool, tool_handler, tool_router,
     transport::{
         stdio,
@@ -25,7 +27,7 @@ use rmcp::{
             session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
         },
     },
-    ErrorData as McpError, ServerHandler, ServiceExt,
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
@@ -77,6 +79,21 @@ struct Args {
     /// 環境変数 `XDF_MCP_NO_HOST_CHECK=1` でも有効化可。
     #[arg(long, env = "XDF_MCP_NO_HOST_CHECK")]
     no_host_check: bool,
+
+    /// HTTP モードで Streamable HTTP の stateful (セッション) モードを有効化する。
+    ///
+    /// 既定は stateless。stateful にすると rmcp は `Mcp-Session-Id` を発行し、以降の
+    /// POST でそれを要求するが、セッションは `LocalSessionManager` によりプロセスの
+    /// メモリ上にしか存在しない。サーバを再起動するとセッションは全消えし、古い ID を
+    /// 掴んだままのクライアントには 404 `Not Found: Session not found` (プレーンテキストで、
+    /// JSON-RPC ですらない) が返り続ける。リバースプロキシ越しだとこれが
+    /// `-32600 Invalid content from server` 等に化けて原因を追いにくい。
+    ///
+    /// 本サーバのツールは全て単発のリクエスト / レスポンスで、サーバ起点の通知も
+    /// 再開 (resumability) も使っていないため、セッションを持つ必要がない。
+    /// 環境変数 `XDF_MCP_STATEFUL=1` でも有効化可。
+    #[arg(long, env = "XDF_MCP_STATEFUL")]
+    stateful: bool,
 
     /// HTTP モードで Bearer token 認証を有効化 (Tailscale Funnel 等で公開する場合に必須)。
     /// 設定するとリクエストに `Authorization: Bearer <token>` ヘッダが必要になる。
@@ -594,9 +611,15 @@ impl ServerHandler for XdfMcpServer {
                 "MCP server exposing X68000 disk image archives (XDF/HDS/HDF) \
                  via full-text search and on-demand file read.",
             );
+        // プロトコルバージョンは固定しない。
+        //
+        // プロトコルバージョンは固定しない (以前は V_2024_11_05 を固定していた)。
+        // 2024-11-05 は Streamable HTTP がまだ存在しない版の仕様であり、HTTP
+        // トランスポートで serve しながらこれを名乗るのは整合しない。ここでは
+        // 既定 (`ProtocolVersion::default()` = `LATEST`) を上限として提示し、
+        // 実際に使う版は下の `initialize` でクライアントと擦り合わせる。
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(info)
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
             .with_instructions(
                 "MCP server exposing X68000 disk image archives (XDF/HDS/HDF) via full-text \
                  search and on-demand file read. All results carry an image_path:partition:file_path \
@@ -604,6 +627,35 @@ impl ServerHandler for XdfMcpServer {
                  sprite examples, etc.)."
                     .to_string(),
             )
+    }
+
+    /// プロトコルバージョンのネゴシエーションを明示的に行う。
+    ///
+    /// rmcp が `min(クライアント提示, サーバ提示)` を適用してくれるのは、initialize
+    /// ハンドシェイクを経由する経路 (stdio / stateful HTTP) だけである。stateless HTTP
+    /// では各リクエストが `serve_directly` で単発処理されるため、この既定実装は
+    /// `get_info()` をそのまま返してしまい、クライアントが要求した版より新しい版を
+    /// 返しうる。MCP 仕様上クライアントは未対応の版を返されたら切断してよいので、
+    /// ここで自前で擦り合わせる。
+    ///
+    /// - クライアント提示が SDK の既知バージョンかつサーバ提示より古い → それを採用
+    /// - それ以外 (未知の版 / サーバより新しい版) → サーバ提示 (= `LATEST`) を返す
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ServerInfo, McpError> {
+        let client_version = request.protocol_version.clone();
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request);
+        }
+        let mut info = self.get_info();
+        if ProtocolVersion::KNOWN_VERSIONS.contains(&client_version)
+            && client_version < info.protocol_version
+        {
+            info.protocol_version = client_version;
+        }
+        Ok(info)
     }
 }
 
@@ -1126,6 +1178,7 @@ async fn main() -> Result<()> {
             &args.allowed_host,
             args.no_host_check,
             &args.auth_token,
+            args.stateful,
         )
         .await
     } else {
@@ -1158,6 +1211,7 @@ async fn run_http(
     extra_allowed_hosts: &[String],
     no_host_check: bool,
     auth_token: &str,
+    stateful: bool,
 ) -> Result<()> {
     let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -1170,8 +1224,26 @@ async fn run_http(
     // Host ヘッダ allowlist の構築:
     // - rmcp デフォルトは localhost / 127.0.0.1 / ::1 のみ許可 (DNS rebinding 防御)
     // - --allowed-host で追加 (Tailscale ホスト名等)、--no-host-check で完全無効化
-    let mut config =
-        StreamableHttpServerConfig::default().with_cancellation_token(cancel.child_token());
+    //
+    // セッションモードの選択:
+    // - 既定は stateless (`Mcp-Session-Id` を発行しない)。公開ツールは全て単発の
+    //   リクエスト / レスポンスで、サーバ起点の通知も resumability も使っていないため、
+    //   セッションを持つ必然性がない。stateful だとサーバ再起動でセッションが全消えし、
+    //   古い ID を握ったままのクライアントに 404 (プレーンテキスト) を返し続けることになる。
+    // - stateless では SSE の枠を外して素の application/json を返せる
+    //   (MCP Streamable HTTP 仕様 2025-06-18 で許可)。プロキシ越しでの取り回しも良い。
+    let mut config = StreamableHttpServerConfig::default()
+        .with_cancellation_token(cancel.child_token())
+        .with_stateful_mode(stateful)
+        .with_json_response(!stateful);
+    eprintln!(
+        "xdf-mcp: Streamable HTTP mode = {}",
+        if stateful {
+            "stateful (Mcp-Session-Id required; sessions are lost on restart)"
+        } else {
+            "stateless (plain JSON responses)"
+        }
+    );
     if no_host_check {
         config = config.disable_allowed_hosts();
         eprintln!("xdf-mcp: Host header check DISABLED (all hosts allowed)");

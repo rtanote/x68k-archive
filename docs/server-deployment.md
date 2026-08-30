@@ -318,14 +318,25 @@ docker logs xdf-mcp 2>&1 | grep "HTTP listening"
 
 ## 10. トラブルシューティング
 
-### 「Couldn't reach the MCP server」
+### 「Couldn't reach the MCP server」/ 「Invalid content from server」
 
-**まず疑うべきはサーバ障害ではなく、セッション切れ。**
-Streamable HTTP のセッションは**メモリ上のみ**に保持される。サーバ再起動
-(ホスト再起動を含む) で全セッションが消えるため、Claude Desktop が保持している
-古い `Mcp-Session-Id` が **404** になり、この表示になる。
+**既定 (stateless) では起きないはず。`--stateful` を付けている場合のみ該当する。**
 
-→ **Claude Desktop でコネクタを切断 → 再連携** (またはアプリ再起動) で直る。
+stateful モードでは Streamable HTTP のセッションが**メモリ上のみ**に保持される。
+サーバ再起動 (ホスト再起動を含む) で全セッションが消えるため、クライアントが
+保持している古い `Mcp-Session-Id` に対してサーバは **404** と
+`Not Found: Session not found` というプレーンテキスト (JSON-RPC ですらない) を
+返し続ける。これがクライアント側では
+
+- Claude Desktop: 「Couldn't reach the MCP server」
+- リバースプロキシ経由 (claude.ai のコネクタ等):
+  `-32600 Anthropic Proxy: Invalid content from server`
+
+として見える。接続もツール一覧も生きているのに**全てのツール呼び出しだけが失敗する**、
+引数やレスポンスのサイズを変えても症状が変わらない、というのが特徴。
+
+→ 恒久対策は `--stateful` を外すこと (既定の stateless に戻す)。
+   その場でしのぐなら、クライアント側でコネクタを切断 → 再連携 (またはアプリ再起動)。
 
 サーバ側が本当に落ちているかの切り分け:
 ```bash
