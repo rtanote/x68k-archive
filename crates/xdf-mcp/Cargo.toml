@@ -23,7 +23,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.23"
 
 # MCP プロトコル実装 (Anthropic 公式の Rust SDK)
-rmcp = { version = "1.5", features = [
+rmcp = { version = "3.1", features = [
     "server",
     "transport-io",
     "transport-streamable-http-server",
