@@ -32,7 +32,7 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 
 # Phase 4b.5: フロッピーグルーピング (xdf-grouping.toml)
 regex = "1"
-toml = "0.8"
+toml = "1.1"
 
 # Phase 5b: 構造化メタデータ抽出
 unicode-normalization = "0.1"
