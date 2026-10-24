@@ -15,7 +15,7 @@ use clap::Parser;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, InitializeRequestParams, ProtocolVersion,
+        CallToolResult, ContentBlock, Implementation, InitializeRequestParams, ProtocolVersion,
         ServerCapabilities, ServerInfo,
     },
     schemars,
@@ -415,7 +415,7 @@ impl XdfMcpServer {
         };
         let json = serde_json::to_string_pretty(&out)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -430,7 +430,7 @@ impl XdfMcpServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let json = serde_json::to_string_pretty(&out)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -444,7 +444,7 @@ impl XdfMcpServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let json = serde_json::to_string_pretty(&out)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -463,7 +463,7 @@ impl XdfMcpServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let json = serde_json::to_string_pretty(&summary)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -471,7 +471,7 @@ impl XdfMcpServer {
                        Takes a PIC file from a disk image (XDF/HDS/HDF, including LZH-internal paths via `!/`) \
                        and decodes it (paletted 4/8-bit + 15/16-bit RGB). \
                        \
-                       Returns metadata text + a Content::image block with PNG. The image appears \
+                       Returns metadata text + a ContentBlock::image block with PNG. The image appears \
                        inside the tool-result UI; in Claude Desktop the result is collapsed by \
                        default — your reply should remind the user to click the 'Archive view image' \
                        row to expand it and view the image. Use `max_width: 512` for large PIC \
@@ -486,8 +486,8 @@ impl XdfMcpServer {
         let meta_json = serde_json::to_string_pretty(&metadata)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         Ok(CallToolResult::success(vec![
-            Content::text(meta_json),
-            Content::image(png_b64, "image/png"),
+            ContentBlock::text(meta_json),
+            ContentBlock::image(png_b64, "image/png"),
         ]))
     }
 
@@ -566,7 +566,7 @@ impl XdfMcpServer {
         };
         let json = serde_json::to_string_pretty(&out)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -595,7 +595,7 @@ impl XdfMcpServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         let json = serde_json::to_string_pretty(&out)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }
 
