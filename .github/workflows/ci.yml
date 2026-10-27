@@ -49,14 +49,6 @@ jobs:
       # このファイル自体が公開リポジトリ上でその値を晒すことになる。
       # そのため「値」ではなく「形」で照合する汎用パターンのみを使う。
 
-      # 実在の Tailscale ホスト名。プレースホルダのみ許可する。
-      - name: no real tailnet hostnames
-        run: |
-          if git ls-files -z | xargs -0 grep -InE '[a-z0-9-]+\.[a-z0-9-]+\.ts\.net' | grep -vE 'your-tailnet|example\.ts\.net|<machine>|<tailnet>'; then
-            echo '::error::real *.ts.net hostname found — use a placeholder'
-            exit 1
-          fi
-
       # API キー / トークンらしき文字列。
       - name: no credentials
         run: |
@@ -84,6 +76,12 @@ jobs:
             echo '::error::private file is tracked'
             exit 1
           fi
+
+      # 個人環境の識別子 (ホスト名 / tailnet 名 / プライベート IP /
+      # 実ユーザのホームパス / メールアドレス) が公開ファイルに混入していないこと。
+      # 具体的な固有名はスクリプト側にも書かない (書くと一覧になってしまう)。
+      - name: no private identifiers
+        run: ./check-identifiers.sh
 
       - uses: dtolnay/rust-toolchain@stable
         with:

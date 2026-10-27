@@ -70,7 +70,7 @@ services:
     #
     # 以前は `test: ["CMD-SHELL", "exit 0"]` を 30 秒間隔で回していた。これは常に成功する
     # no-op で死活情報を一切生まない一方、30 秒ごとにコンテナ内で exec (= runc) を
-    # 起こし続ける。2026-10-27、本番 (hp-mini-ws) で containerd の exec 経路が壊れ
+    # 起こし続ける。2026-10-27、実運用中のホストで containerd の exec 経路が壊れ
     # (`copy stream failed: reading from a closed fifo` /
     #  `timed out starting health check`)、以後 dockerd が失敗した exec を削除できず
     # (`Failed to delete exec process after failing to start: DeadlineExceeded`)、
