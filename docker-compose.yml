@@ -66,11 +66,21 @@ services:
       # 空なら download_url は空文字列が返る (output_path のみ)。
       - XDF_MCP_PUBLIC_URL=${XDF_MCP_PUBLIC_URL:-}
     restart: unless-stopped
-    healthcheck:
-      # MCP の HTTP エンドポイントは GET で 200 を返さないので存在確認のみ
-      test: ["CMD-SHELL", "exit 0"]
-      interval: 30s
-      timeout: 5s
+    # healthcheck は意図的に設定しない。
+    #
+    # 以前は `test: ["CMD-SHELL", "exit 0"]` を 30 秒間隔で回していた。これは常に成功する
+    # no-op で死活情報を一切生まない一方、30 秒ごとにコンテナ内で exec (= runc) を
+    # 起こし続ける。2026-10-27、本番 (hp-mini-ws) で containerd の exec 経路が壊れ
+    # (`copy stream failed: reading from a closed fifo` /
+    #  `timed out starting health check`)、以後 dockerd が失敗した exec を削除できず
+    # (`Failed to delete exec process after failing to start: DeadlineExceeded`)、
+    # D 状態 (kill -9 不可) の runc が毎分 1 個ずつ漏れ続けた。
+    # 約 40 時間で 2,415 個に達し、16GB + swap 4GB を食い潰してホストごと停止した。
+    # 得るものが無い検査のために事故経路を常時踏み続ける構成だったため削除する。
+    #
+    # 死活監視が必要なら exec を使わない外部 / ホスト側からの HTTP 検査にすること。
+    # ルートパスへの GET は 404 を返すが、応答が返ること自体が生存の証明になる。
+    # 例: curl -fsS -o /dev/null -w '%{http_code}' http://localhost:8765/ → 404 なら生存
 
 volumes:
   xdf_index:
