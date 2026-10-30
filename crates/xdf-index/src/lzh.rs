@@ -228,9 +228,38 @@ fn header_mtime_unix(header: &LhaHeader) -> i64 {
     }
 }
 
+/// 多段 LZH パスに対応したメンバー取り出し。
+///
+/// `inner_path` に `!/` が含まれる場合 (例: `"INNER.LZH!/file.txt"`)、
+/// 外側から順に展開していく。索引側 (`index_lzh_bytes`) は `LzhOpts::max_depth`
+/// の既定値 2 で「LZH の中の LZH」まで展開するため、読み出し側も同じ深さまで
+/// 辿れないと**索引には載っているのに読めないドキュメント**が生まれる。
+///
+/// `max_depth` は LZH の入れ子の総数 (1 = 入れ子なし、2 = LZH 内の LZH まで)。
+/// 索引側と同じ値を渡すこと。
+pub fn extract_member_nested(bytes: &[u8], inner_path: &str, max_depth: usize) -> Result<Vec<u8>> {
+    let segments: Vec<&str> = inner_path.split("!/").collect();
+    if segments.len() > max_depth {
+        return Err(anyhow!(
+            "LZH nesting too deep: {} levels requested, limit is {}",
+            segments.len(),
+            max_depth
+        ));
+    }
+
+    // 1 段目は借用のまま、2 段目以降は展開結果を持ち回る
+    let mut current: Vec<u8> = extract_member(bytes, segments[0])?;
+    for seg in &segments[1..] {
+        current = extract_member(&current, seg)?;
+    }
+    Ok(current)
+}
+
 /// LZH バイト列から指定メンバーを取り出す。
 /// `inner_path` は LZH 内部のフルパス (例: "SHOKA1.ZMS" や "subdir/file.zms")。
 /// 大文字小文字無視マッチで探索。
+///
+/// 多段 (`a.lzh!/b.lzh!/file`) を扱う場合は [`extract_member_nested`] を使うこと。
 pub fn extract_member(bytes: &[u8], inner_path: &str) -> Result<Vec<u8>> {
     let cursor = Cursor::new(bytes);
     let mut reader = LhaDecodeReader::new(cursor)
@@ -262,4 +291,51 @@ pub fn extract_member(bytes: &[u8], inner_path: &str) -> Result<Vec<u8>> {
         }
     }
     Err(anyhow!("Member not found in LZH: {}", inner_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 深度上限を超えるパスは、展開を試みる前にエラーにする。
+    /// (LZH ボム対策の上限が効いていることの確認)
+    #[test]
+    fn nested_extract_rejects_paths_deeper_than_limit() {
+        // 3 セグメント = 3 段。既定の 2 を超えるので弾かれる
+        let err = extract_member_nested(b"dummy", "a.lzh!/b.lzh!/c.txt", 2).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nesting too deep"),
+            "深度超過のエラーが返るべき: {msg}"
+        );
+
+        // 上限を上げれば深度チェックは通過し、実際の展開処理まで進む
+        // (バイト列が LZH ではないので別のエラーになる = 深度では弾かれていない)
+        let err = extract_member_nested(b"dummy", "a.lzh!/b.lzh!/c.txt", 3).unwrap_err();
+        assert!(
+            !err.to_string().contains("nesting too deep"),
+            "上限内なら深度エラーにはならないはず: {err}"
+        );
+    }
+
+    /// 単段のパスは深度 1 でも通る (= 深度チェックのオフバイワンが無いこと)
+    #[test]
+    fn nested_extract_allows_single_segment_at_depth_one() {
+        let err = extract_member_nested(b"dummy", "file.txt", 1).unwrap_err();
+        assert!(
+            !err.to_string().contains("nesting too deep"),
+            "単段は深度 1 で通るべき: {err}"
+        );
+    }
+
+    /// 索引側の既定深度と、読み出し側が想定する深度が揃っていること。
+    /// ここがずれると「索引には載っているのに読めない」ドキュメントが生まれる。
+    #[test]
+    fn index_default_depth_is_two() {
+        assert_eq!(
+            LzhOpts::default().max_depth,
+            2,
+            "既定深度を変えるなら xdf-mcp の LZH_MAX_DEPTH も合わせること"
+        );
+    }
 }

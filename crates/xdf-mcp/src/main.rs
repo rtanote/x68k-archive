@@ -30,6 +30,10 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
 };
 use axum::response::IntoResponse;
+
+/// LZH の入れ子を辿る最大段数。索引側 `LzhOpts::max_depth` の既定値と揃える。
+/// ここがずれると「索引には載っているのに読めない」ドキュメントが生まれる。
+const LZH_MAX_DEPTH: usize = 2;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -688,13 +692,10 @@ fn read_file_impl(params: &ReadParams) -> Result<ReadOutput> {
     };
 
     let bytes = if let Some(inner) = inner_path {
-        // ネスト LZH (`a.lzh!/b.lzh!/file.txt`) には未対応 — 1階層まで
-        if inner.contains("!/") {
-            return Err(anyhow::anyhow!(
-                "Nested LZH paths (multi-level !/) are not supported in archive_read"
-            ));
-        }
-        xdf_index::lzh::extract_member(&outer_bytes, inner)?
+        // ネスト LZH (`a.lzh!/b.lzh!/file.txt`) にも対応する。
+        // 索引側は LzhOpts::max_depth (既定 2) で「LZH の中の LZH」まで展開するので、
+        // 読み出しも同じ深さを許さないと索引にあるのに読めないドキュメントが生じる。
+        xdf_index::lzh::extract_member_nested(&outer_bytes, inner, LZH_MAX_DEPTH)?
     } else {
         outer_bytes
     };
@@ -870,10 +871,11 @@ fn read_raw_bytes(params: &ReadParams) -> Result<Vec<u8>> {
     };
 
     if let Some(inner) = inner_path {
-        if inner.contains("!/") {
-            anyhow::bail!("Nested LZH paths (multi-level !/) are not supported");
-        }
-        Ok(xdf_index::lzh::extract_member(&outer_bytes, inner)?)
+        Ok(xdf_index::lzh::extract_member_nested(
+            &outer_bytes,
+            inner,
+            LZH_MAX_DEPTH,
+        )?)
     } else {
         Ok(outer_bytes)
     }
