@@ -198,19 +198,83 @@ fn add_member_document(
 }
 
 /// LZH ヘッダからファイル名 (UTF-8 文字列) を取得。
-/// `parse_pathname()` は ISO-8859-1 やヘッダ指定エンコーディングで返すため、
-/// X68000 LZH (SJIS) ではバイト列を経由して再デコードする必要がある。
+///
+/// **ディレクトリ部分と SJIS の両方を保つ必要がある。**
+///
+/// レベル 1 以上のヘッダでは、`header.filename` に入るのは**ベース名だけ**で、
+/// ディレクトリは拡張ヘッダ側にある (レベル 2/3 では `filename` は常に空)。
+/// 一方 `parse_pathname()` はディレクトリを含む完全なパスを組み立ててくれるが、
+/// 非 ASCII バイトを `%8e%f1` のようにパーセントエンコードして返す
+/// (delharc の `parse_str_nilterm`)。X68000 の LZH はファイル名が SJIS なので、
+/// そのままでは読めない。
+///
+/// そこで `parse_pathname_to_str()` の結果をパーセントデコードしてバイト列に戻し、
+/// それを SJIS としてデコードする。`/` や `.` は ASCII なのでエンコードされず、
+/// ディレクトリ構造は保たれる。
+///
+/// 以前は `header.filename` を直接 SJIS デコードしていたため、
+/// **ディレクトリが常に失われ、サブディレクトリにある同名ファイルが
+/// 同一パスに潰れていた** (読み出しは先頭の 1 件しか返せず、別ファイルの
+/// 内容が返る状態だった)。
 fn decode_lzh_filename_from_header(header: &LhaHeader) -> String {
-    // 第一手: parse_pathname がそれっぽい文字列を返すならそれ
-    let parsed = header.parse_pathname();
-    let s = parsed.to_string_lossy().to_string();
-    // 化けたかどうかの簡易判定: 多バイト相当が含まれず制御文字が多いなら SJIS 再デコードを試す
-    if s.bytes().any(|b| b >= 0x80) || s.is_empty() {
-        // それなりに非ASCIIが残っているなら、parse_pathname の戻りがそのまま使えそう
-        return s;
+    let base_raw: &[u8] = &header.filename;
+
+    // delharc がパス分割に使うバイト。SJIS の 2 バイト目にも現れうる (ダメ文字)。
+    let splits_on = |b: &u8| matches!(*b, 0xFF | b'/' | b'\\');
+
+    // レベル 2/3 では filename が空でディレクトリ込みの名前が拡張ヘッダにしかない。
+    // またベース名自体が分割対象バイトを含む場合 (能=94 5C, 表=95 5C など) は、
+    // delharc が**文字の途中で分割してバイトを捨てている**ため復元できない。
+    // どちらの場合も従来どおりベース名のみを返し、退行させない。
+    if base_raw.is_empty() || base_raw.iter().any(splits_on) {
+        return decode_sjis_lossy(base_raw);
     }
-    // それ以外は raw バイト列 (filename フィールド) から SJIS デコード
-    decode_sjis_lossy(&header.filename)
+
+    // ここまで来れば base_raw は分割されていないので、
+    // parse_pathname_to_str() の末尾セグメントがベース名に対応する。
+    // その手前がディレクトリ。
+    //
+    // ディレクトリを拾う目的は、LZH 内のサブディレクトリにある同名ファイルが
+    // 同一パスに潰れて読み出しが別ファイルを返すのを防ぐこと。
+    let encoded = header.parse_pathname_to_str();
+    let base = decode_sjis_lossy(base_raw);
+    match encoded.rfind('/') {
+        Some(i) => {
+            let dir = decode_sjis_lossy(&percent_decode_to_bytes(&encoded[..i]));
+            if dir.is_empty() {
+                base
+            } else {
+                format!("{dir}/{base}")
+            }
+        }
+        None => base,
+    }
+}
+
+/// `parse_str_nilterm` が作る `%xx` 表記をバイト列に戻す。
+///
+/// 注意: delharc は `%` 自体をエスケープしない (0x25 は ASCII 範囲なのでそのまま出る)。
+/// そのため `%` の後ろが 16 進 2 桁でない場合は**エスケープではない**とみなし、
+/// `%` をそのまま 1 バイトとして扱う。こうしないと `100%ab.txt` のような
+/// ファイル名を壊してしまう。
+fn percent_decode_to_bytes(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 /// メンバーが LZH かどうか (拡張子チェック)
@@ -325,6 +389,98 @@ mod tests {
         assert!(
             !err.to_string().contains("nesting too deep"),
             "単段は深度 1 で通るべき: {err}"
+        );
+    }
+
+    /// パーセントデコードが SJIS バイト列を正しく復元すること。
+    /// delharc は非 ASCII を `%8e%f1` のように出すので、これを戻して
+    /// SJIS デコードしないと日本語ファイル名が読めない。
+    #[test]
+    fn percent_decode_restores_sjis_bytes() {
+        // "QUIZDATA/400_首相.QZ" の SJIS 表現
+        let encoded = "QUIZDATA/400_%8e%f1%91%8a.QZ";
+        let bytes = percent_decode_to_bytes(encoded);
+        // SJIS の "首相" は 0x8e 0xf1 0x91 0x8a。
+        // バイト列リテラルに非 ASCII を直接書くとソースの文字コードに依存するので、
+        // 期待値はエスケープで組み立てる。
+        let mut want = b"QUIZDATA/400_".to_vec();
+        want.extend_from_slice(&[0x8e, 0xf1, 0x91, 0x8a]);
+        want.extend_from_slice(b".QZ");
+        assert_eq!(
+            bytes, want,
+            "ASCII 部分はそのまま、%xx のみバイトに戻ること"
+        );
+        let decoded = decode_sjis_lossy(&bytes);
+        assert!(
+            decoded.starts_with("QUIZDATA/400_") && decoded.ends_with(".QZ"),
+            "ディレクトリと拡張子が保たれること: {decoded}"
+        );
+        assert!(
+            decoded.contains('首') || decoded.contains('相'),
+            "SJIS が日本語にデコードされること: {decoded}"
+        );
+    }
+
+    /// delharc は `%` 自体をエスケープしない (0x25 は ASCII 範囲)。
+    /// そのため `%` の後ろが 16 進 2 桁でなければエスケープ扱いしてはいけない。
+    #[test]
+    fn percent_decode_keeps_literal_percent() {
+        assert_eq!(percent_decode_to_bytes("100%.txt"), b"100%.txt".to_vec());
+        assert_eq!(percent_decode_to_bytes("a%zz"), b"a%zz".to_vec());
+        assert_eq!(percent_decode_to_bytes("%"), b"%".to_vec());
+        assert_eq!(percent_decode_to_bytes("ab%2"), b"ab%2".to_vec());
+        // 一方、正しい 16 進 2 桁はバイトに戻す
+        assert_eq!(percent_decode_to_bytes("a%41b"), b"aAb".to_vec());
+    }
+
+    /// ディレクトリ区切りは ASCII なのでエンコードされず、そのまま残ること。
+    #[test]
+    fn percent_decode_preserves_directory_separators() {
+        let b = percent_decode_to_bytes("src/Makefile");
+        assert_eq!(b, b"src/Makefile".to_vec());
+        assert_eq!(decode_sjis_lossy(&b), "src/Makefile");
+    }
+
+    /// SJIS の「ダメ文字」を含むベース名は、ディレクトリ付与を諦めて
+    /// 従来どおりベース名のみを返すこと (退行防止)。
+    ///
+    /// SJIS の 2 バイト文字は 2 バイト目に 0x5C (`\`) や 0x2F (`/`) を取りうる
+    /// (能=94 5C, 表=95 5C, ソ=83 5C, 予=97 5C, 構=8D 5C)。delharc の
+    /// `parse_pathname_to_str()` は **エンコードより先に** 0xFF / `/` / `\` で
+    /// 分割するため、この 2 バイト目は捨てられて後段では復元できない。
+    /// したがって「SJIS を解釈して区切りを判定し直す」方式は原理的に成立しない。
+    /// 該当するベース名は検出してフォールバックするのが唯一安全な方法。
+    #[test]
+    fn dame_moji_base_names_fall_back_to_raw_filename() {
+        // 能 = 94 5C (2 バイト目が 0x5C)
+        let dame: Vec<u8> = {
+            let mut v = b"566_".to_vec();
+            v.extend_from_slice(&[0x8c, 0x7c]); // 芸
+            v.extend_from_slice(&[0x94, 0x5c]); // 能
+            v.extend_from_slice(b".QZ");
+            v
+        };
+        assert!(
+            dame.iter().any(|b| matches!(*b, 0xFF | b'/' | b'\\')),
+            "このベース名は分割対象バイトを含む = フォールバック経路に入る"
+        );
+
+        // フォールバック先の挙動: 生バイトをそのまま SJIS デコードする
+        let decoded = decode_sjis_lossy(&dame);
+        assert!(
+            !decoded.contains('/'),
+            "偽のパス区切りが混入しないこと: {decoded}"
+        );
+        assert!(
+            !decoded.contains('\u{FFFD}'),
+            "ダメ文字が置換文字にならないこと: {decoded}"
+        );
+
+        // 一方、分割対象バイトを含まない名前はディレクトリ付与の対象になる
+        let safe = b"Makefile";
+        assert!(
+            !safe.iter().any(|b| matches!(*b, 0xFF | b'/' | b'\\')),
+            "ASCII のベース名はディレクトリ付与の対象"
         );
     }
 
