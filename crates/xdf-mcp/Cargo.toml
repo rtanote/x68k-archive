@@ -43,7 +43,7 @@ schemars = "1.0"
 
 # archive_extract: 複数ファイル/ディレクトリを一括 ZIP 化
 # Store のみ使用 (X68000 ファイルは既に圧縮されているケースが多く再圧縮の利得は小)
-zip = { version = "2", default-features = false }
+zip = { version = "9", default-features = false }
 # 一時 ZIP ファイルの一意 ID
 uuid = { version = "1", features = ["v4"] }
 # paths の glob (`*.X` `IKAP/**/*` 等) サポート
