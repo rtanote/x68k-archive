@@ -14,7 +14,13 @@ services:
     container_name: xdf-mcp
     command: ["xdf-mcp", "--index", "/index", "--http", "0.0.0.0:8765"]
     ports:
-      - "${HTTP_PORT:-8765}:8765"
+      # 既定は loopback のみ。リバースプロキシやトンネルの後ろに置く前提で、
+      # それらは同じホストの localhost に繋ぐので、これで足りる。
+      # 別ホストから直接使うなら .env の HTTP_BIND_IP で変える。
+      #
+      # コンテナ内の --http 0.0.0.0:8765 はそのまま。あれは port mapping の
+      # 受け口で、外に出す口ではない。
+      - "${HTTP_BIND_IP:-127.0.0.1}:${HTTP_PORT:-8765}:8765"
     volumes:
       # アーカイブは read-only bind mount。.env で ARCHIVE_DIR を切替可能
       #
