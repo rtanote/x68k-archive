@@ -198,7 +198,7 @@ fn add_member_document(
 }
 
 /// 索引のパス (`target`) と LZH メンバー名の照合結果。
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NameMatch {
     /// パスが丸ごと一致した。paths v2 の索引で起きる。
     Full,
@@ -220,6 +220,27 @@ fn match_member_name(name_norm: &str, target: &str) -> NameMatch {
         return NameMatch::BaseOnly;
     }
     NameMatch::No
+}
+
+/// メンバー名の一覧から、`target` に対して返すべきものを選ぶ。
+///
+/// **完全一致はアーカイブ全体を見てから決める。** 出てきた順に 1 回だけ見る
+/// 作りにすると、`src/foo.c` が root の `foo.c` より前にあるとき、`foo.c` の
+/// 要求にベース名一致の方を返してしまう。作り直した索引でも間違ったファイルを
+/// 返すことになるので、ここは妥協できない。
+///
+/// 優先順位の規則をこの関数だけに置いているのは、実アーカイブを用意せずに
+/// 検査できるようにするため。
+fn choose_member(names: &[String], target: &str) -> Option<(usize, NameMatch)> {
+    let mut base_only: Option<usize> = None;
+    for (i, n) in names.iter().enumerate() {
+        match match_member_name(n, target) {
+            NameMatch::Full => return Some((i, NameMatch::Full)),
+            NameMatch::BaseOnly if base_only.is_none() => base_only = Some(i),
+            _ => {}
+        }
+    }
+    base_only.map(|i| (i, NameMatch::BaseOnly))
 }
 
 /// ベース名での後退に入ったことを、プロセスにつき一度だけ伝える。
@@ -361,36 +382,38 @@ pub fn extract_member_nested(bytes: &[u8], inner_path: &str, max_depth: usize) -
     Ok(current)
 }
 
-/// LZH バイト列から指定メンバーを取り出す。
-/// `inner_path` は LZH 内部のフルパス (例: "SHOKA1.ZMS" や "subdir/file.zms")。
-/// 大文字小文字無視マッチで探索。
-///
-/// 多段 (`a.lzh!/b.lzh!/file`) を扱う場合は [`extract_member_nested`] を使うこと。
-pub fn extract_member(bytes: &[u8], inner_path: &str) -> Result<Vec<u8>> {
+/// ヘッダだけを辿ってメンバー名を順に集める。ディレクトリは飛ばす。
+/// 返る添字は [`read_member_at`] の添字と同じ数え方。
+fn member_names(bytes: &[u8]) -> Result<Vec<String>> {
     let cursor = Cursor::new(bytes);
     let mut reader = LhaDecodeReader::new(cursor)
         .map_err(|e| anyhow!("LZH header parse failed: {}", e))?;
-    let target = inner_path.to_ascii_lowercase();
-    let target = target.trim_start_matches('/').to_string();
-
+    let mut out = Vec::new();
     loop {
-        let header_clone = reader.header().clone();
-        let header = &header_clone;
+        let header = reader.header().clone();
         if !header.is_directory() {
-            let name = decode_lzh_filename_from_header(header);
-            let name_norm = name.to_ascii_lowercase();
-            // paths v1 の索引はディレクトリ抜きのパスを持っている。完全一致で
-            // 見つからないときはベース名でも拾う。これが無いと、索引を作り直して
-            // いない利用者が pull した瞬間に、サブディレクトリにあるメンバーを
-            // 読めなくなる。
-            //
-            // 後退した側では同名衝突の曖昧さが残る（先に出てきた方を返す）が、
-            // それは v1 索引での従来の挙動と同じで、退行ではない。
-            let m = match_member_name(&name_norm, &target);
-            if m == NameMatch::BaseOnly {
-                warn_stale_index_once();
-            }
-            if m != NameMatch::No {
+            out.push(decode_lzh_filename_from_header(&header).to_ascii_lowercase());
+        }
+        match reader.next_file() {
+            Ok(true) => continue,
+            Ok(false) => break,
+            Err(e) => return Err(anyhow!("LZH next_file error: {}", e)),
+        }
+    }
+    Ok(out)
+}
+
+/// [`member_names`] と同じ数え方の添字で、そのメンバーを展開する。
+fn read_member_at(bytes: &[u8], want: usize) -> Result<Vec<u8>> {
+    let cursor = Cursor::new(bytes);
+    let mut reader = LhaDecodeReader::new(cursor)
+        .map_err(|e| anyhow!("LZH header parse failed: {}", e))?;
+    let mut i = 0usize;
+    loop {
+        let header = reader.header().clone();
+        if !header.is_directory() {
+            if i == want {
+                let name = decode_lzh_filename_from_header(&header);
                 if !reader.is_decoder_supported() {
                     return Err(anyhow!("Unsupported compression for: {}", name));
                 }
@@ -400,6 +423,7 @@ pub fn extract_member(bytes: &[u8], inner_path: &str) -> Result<Vec<u8>> {
                     .map_err(|e| anyhow!("LZH decode error for {}: {}", name, e))?;
                 return Ok(data);
             }
+            i += 1;
         }
         match reader.next_file() {
             Ok(true) => continue,
@@ -407,7 +431,33 @@ pub fn extract_member(bytes: &[u8], inner_path: &str) -> Result<Vec<u8>> {
             Err(e) => return Err(anyhow!("LZH next_file error: {}", e)),
         }
     }
-    Err(anyhow!("Member not found in LZH: {}", inner_path))
+    Err(anyhow!("LZH member index {} vanished between passes", want))
+}
+
+/// LZH バイト列から指定メンバーを取り出す。
+/// `inner_path` は LZH 内部のフルパス (例: "SHOKA1.ZMS" や "subdir/file.zms")。
+/// 大文字小文字無視マッチで探索。
+///
+/// 多段 (`a.lzh!/b.lzh!/file`) を扱う場合は [`extract_member_nested`] を使うこと。
+pub fn extract_member(bytes: &[u8], inner_path: &str) -> Result<Vec<u8>> {
+    let target = inner_path.to_ascii_lowercase();
+    let target = target.trim_start_matches('/').to_string();
+
+    // ヘッダだけを一周して名前を集める。中身は展開しないので安い。
+    // 完全一致を全体から探すために、選ぶ前に全員を見る必要がある。
+    let names = member_names(bytes)?;
+    let (want_index, how) = choose_member(&names, &target)
+        .ok_or_else(|| anyhow!("Member not found in LZH: {}", inner_path))?;
+
+    // paths v1 の索引はディレクトリ抜きのパスを持っている。完全一致が無いときに
+    // ベース名で拾うのは、索引を作り直していない利用者が pull した瞬間に
+    // 読めなくならないようにするため。曖昧さは残るが、それは v1 索引での
+    // 従来の挙動と同じで退行ではない。
+    if how == NameMatch::BaseOnly {
+        warn_stale_index_once();
+    }
+
+    read_member_at(bytes, want_index)
 }
 
 #[cfg(test)]
@@ -556,6 +606,37 @@ mod tests {
             match_member_name("a/b/deep.txt", "deep.txt"),
             NameMatch::BaseOnly
         );
+    }
+
+    #[test]
+    fn exact_match_wins_even_when_it_comes_later() {
+        // Copilot が見つけた並び順の罠。src/foo.c が先にあると、1 周で
+        // 決める作りでは "foo.c" の要求にベース名一致を返してしまう。
+        let names = vec!["src/foo.c".to_string(), "foo.c".to_string()];
+        assert_eq!(
+            choose_member(&names, "foo.c"),
+            Some((1, NameMatch::Full)),
+            "完全一致が後ろにあっても、そちらを選ぶこと"
+        );
+    }
+
+    #[test]
+    fn base_name_is_used_only_when_no_exact_match_exists() {
+        let names = vec!["a/x.c".to_string(), "src/foo.c".to_string()];
+        assert_eq!(
+            choose_member(&names, "foo.c"),
+            Some((1, NameMatch::BaseOnly)),
+            "完全一致が無いならベース名で拾う"
+        );
+        // 候補が複数あるときは先に出てきた方（v1 索引での従来の挙動）
+        let dup = vec!["b/foo.c".to_string(), "a/foo.c".to_string()];
+        assert_eq!(choose_member(&dup, "foo.c"), Some((0, NameMatch::BaseOnly)));
+    }
+
+    #[test]
+    fn choose_member_finds_nothing_when_absent() {
+        let names = vec!["src/foo.c".to_string(), "bar.c".to_string()];
+        assert_eq!(choose_member(&names, "baz.c"), None);
     }
 
     #[test]

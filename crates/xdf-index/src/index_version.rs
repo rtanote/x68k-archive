@@ -13,8 +13,9 @@
 //! **版を上げるのは、索引に入る値が変わったときだけ。** 検索の仕方や表示の
 //! 変更では上げない。上げると利用者に作り直しを促すことになるので、安くない。
 
+use anyhow::Result;
 use std::path::Path;
-use tantivy::Index;
+use tantivy::{Index, IndexWriter};
 
 /// 索引に入るパスの表し方の版。
 ///
@@ -49,6 +50,40 @@ pub fn read_paths_version(index: &Index) -> u32 {
 /// 索引ディレクトリを開いて版を読む。開けなければ `None`。
 pub fn read_paths_version_at(index_dir: &Path) -> Option<u32> {
     Index::open_in_dir(index_dir).ok().as_ref().map(read_paths_version)
+}
+
+/// 現在の版を刻んで commit する。
+///
+/// **索引の中身が丸ごとその版で作られたときだけ使う。** 一部しか触っていない
+/// のに刻むと、古い規則で入ったドキュメントが残っているのに「新しい索引」と
+/// 名乗ることになり、作り直しの案内が出なくなる。
+pub fn commit_stamped(writer: &mut IndexWriter) -> Result<()> {
+    let mut prepared = writer.prepare_commit()?;
+    prepared.set_payload(&current_payload());
+    prepared.commit()?;
+    Ok(())
+}
+
+/// いまの印を保ったまま commit する。
+///
+/// tantivy の payload は commit ごとに持ち越されない。何も指定せずに commit
+/// すると印が消え、次に開いたとき v1 と判定されて、作り直したばかりの索引に
+/// 対してまた作り直しを促すことになる。索引の一部だけを書き換える処理
+/// (増分ビルド、メタデータ抽出) はこちらを使う。
+pub fn commit_preserving(index: &Index, writer: &mut IndexWriter) -> Result<()> {
+    let keep = index.load_metas().ok().and_then(|m| m.payload);
+    match keep {
+        Some(p) => {
+            let mut prepared = writer.prepare_commit()?;
+            prepared.set_payload(&p);
+            prepared.commit()?;
+        }
+        // 元から印が無い索引。足してしまうと嘘になるので、そのまま。
+        None => {
+            writer.commit()?;
+        }
+    }
+    Ok(())
 }
 
 /// 作り直しが必要かどうかと、その理由。
@@ -115,6 +150,36 @@ mod tests {
                 "payload {p:?} は v1 扱いになること"
             );
         }
+    }
+
+    #[test]
+    fn preserving_commit_keeps_the_mark() {
+        let index = ram_index_with_payload(Some(&current_payload()));
+        let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
+        commit_preserving(&index, &mut writer).unwrap();
+        assert_eq!(
+            read_paths_version(&index),
+            PATHS_VERSION,
+            "一部だけ書き換える commit で印が消えないこと"
+        );
+    }
+
+    #[test]
+    fn preserving_commit_does_not_invent_a_mark() {
+        // 印の無い索引に勝手に v2 を付けない。付けると、古い規則のまま
+        // 「新しい」と名乗ることになる。
+        let index = ram_index_with_payload(None);
+        let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
+        commit_preserving(&index, &mut writer).unwrap();
+        assert_eq!(read_paths_version(&index), 1);
+    }
+
+    #[test]
+    fn stamped_commit_sets_the_mark() {
+        let index = ram_index_with_payload(None);
+        let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
+        commit_stamped(&mut writer).unwrap();
+        assert_eq!(read_paths_version(&index), PATHS_VERSION);
     }
 
     #[test]
