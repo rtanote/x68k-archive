@@ -1149,6 +1149,14 @@ async fn main() -> Result<()> {
         Searcher::open(&args.index)
             .with_context(|| format!("Cannot open index at {:?}", args.index))?,
     );
+    // 索引の作り方の版を見て、作り直しが要るなら起動時に言う。公開リポジトリ
+    // なので、バイナリだけ更新した利用者がここで気づけるようにしておく。
+    // 読めないときは黙る（索引が開けているなら致命的ではない）。
+    if let Some(v) = xdf_index::index_version::read_paths_version_at(&args.index) {
+        if let Some(note) = xdf_index::index_version::staleness_note(v) {
+            eprintln!("xdf-mcp: warning: {note}");
+        }
+    }
     let index_dir = Arc::new(args.index.clone());
     let extract_dir = Arc::new(
         args.extract_dir
