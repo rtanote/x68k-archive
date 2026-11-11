@@ -275,6 +275,20 @@ fn choose_member(names: &[String], target: &str) -> Option<(usize, NameMatch)> {
     pick.settle().map(|i| (i, NameMatch::BaseOnly))
 }
 
+/// ベース名で後退したときの警告文。
+///
+/// 作り直しの手順は [`crate::index_version::REBUILD_HOWTO`] から取る。ここに
+/// 書き写すと、片方だけ直して「打っても失敗するコマンド」を案内することになる。
+fn stale_index_warning() -> String {
+    format!(
+        "warning: LZH メンバーをベース名で引き当てました。索引が \
+         paths v1 (ディレクトリ抜き) で作られている可能性があります。\n\
+         同名ファイルが複数ある場合、別のファイルの内容が返ることがあります。\n\
+         {}",
+        crate::index_version::REBUILD_HOWTO
+    )
+}
+
 /// ベース名での後退に入ったことを、プロセスにつき一度だけ伝える。
 ///
 /// 毎回出すと、索引全体を走るような使い方でログが埋まる。知りたいのは
@@ -283,12 +297,7 @@ fn warn_stale_index_once() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "warning: LZH メンバーをベース名で引き当てました。索引が \
-             paths v1 (ディレクトリ抜き) で作られている可能性があります。\n\
-             同名ファイルが複数ある場合、別のファイルの内容が返ることがあります。\n\
-             `xdf-index build --fresh` で作り直してください。"
-        );
+        eprintln!("{}", stale_index_warning());
     }
 }
 
@@ -699,6 +708,16 @@ mod tests {
         // 候補は最初のものだけ覚える
         assert!(!pick.offer(1, NameMatch::BaseOnly));
         assert_eq!(pick.settle(), Some(0));
+    }
+
+    #[test]
+    fn warning_tells_a_command_that_runs() {
+        // 読み出し側の警告も、打てる手順を出すこと。`--fresh` だけ書いた案内は
+        // 「引数が足りない」で失敗する。
+        let w = stale_index_warning();
+        for must in ["xdf-index build", "--fresh", "--out", "アーカイブのパス"] {
+            assert!(w.contains(must), "警告に {must} が無い: {w}");
+        }
     }
 
     #[test]

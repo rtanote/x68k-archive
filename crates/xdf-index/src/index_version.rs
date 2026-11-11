@@ -86,9 +86,20 @@ pub fn commit_preserving(index: &Index, writer: &mut IndexWriter) -> Result<()> 
     Ok(())
 }
 
+/// 索引を作り直す手順。**案内を出す箇所はすべてここを通す。**
+///
+/// `build` は `<archive_dir>` と `--out` が必須なので、`--fresh` だけ書いた
+/// 案内は「引数が足りない」で失敗する。案内する箇所が増えるたびに同じ間違いを
+/// するより、文面を 1 つにして検査で縛る方が確実。
+pub const REBUILD_HOWTO: &str = "次で作り直してください (summaries/ は消えません)。\n\
+     \n\
+     \x20   xdf-index build --fresh --out <索引のパス> <アーカイブのパス>\n\
+     \n\
+     --out とアーカイブのパスは省略できません。";
+
 /// 作り直しが必要かどうかと、その理由。
 ///
-/// 返すのは「利用者に見せる 1 行」。`None` なら何も言わなくてよい。
+/// 返すのは「利用者に見せる文」。`None` なら何も言わなくてよい。
 pub fn staleness_note(found: u32) -> Option<String> {
     if found >= PATHS_VERSION {
         return None;
@@ -96,11 +107,7 @@ pub fn staleness_note(found: u32) -> Option<String> {
     Some(format!(
         "索引は paths v{found} の規則で作られています (このビルドは v{PATHS_VERSION})。\n\
          LZH 内のサブディレクトリにあるファイルは、パスにディレクトリが入って\n\
-         いないため曖昧です。次で作り直してください (summaries/ は消えません)。\n\
-         \n\
-         \x20   xdf-index build --fresh --out <索引のパス> <アーカイブのパス>\n\
-         \n\
-         --out とアーカイブのパスは省略できません。"
+         いないため曖昧です。{REBUILD_HOWTO}"
     ))
 }
 
@@ -190,11 +197,53 @@ mod tests {
         assert!(staleness_note(PATHS_VERSION).is_none());
         assert!(staleness_note(PATHS_VERSION + 1).is_none(), "進んでいる索引には何も言わない");
         let note = staleness_note(1).expect("v1 には注意を出す");
-        // そのまま打てる形であること。build は archive_dir と --out が必須で、
-        // `--fresh` だけ書くと「引数が足りない」で失敗する。案内が失敗する
-        // コマンドを教えていては、印を入れた意味がない。
+        assert!(note.contains(REBUILD_HOWTO), "手順は 1 箇所から取ること: {note}");
+    }
+
+    /// 手順がそのまま打てる形であることを、文面側で縛る。`build` は
+    /// `<archive_dir>` と `--out` が必須なので、`--fresh` だけの案内は失敗する。
+    /// 失敗するコマンドを教えていては、印を入れた意味がない。
+    #[test]
+    fn howto_is_a_command_that_runs() {
         for must in ["xdf-index build", "--fresh", "--out", "アーカイブのパス"] {
-            assert!(note.contains(must), "案内に {must} が無い: {note}");
+            assert!(REBUILD_HOWTO.contains(must), "手順に {must} が無い");
         }
+    }
+
+    /// 作り直しの案内は、このクレートのどこに書いても「そのまま打てる」こと。
+    ///
+    /// `build` は `<archive_dir>` と `--out` が必須なので、`--fresh` だけ書いた
+    /// 案内は「引数が足りない」で失敗する。実際に 3 箇所で同じ間違いをしていた
+    /// ので、文面を [`REBUILD_HOWTO`] に寄せるだけでなく、後から書き足された
+    /// 案内も見張る。1 箇所直して終わりにすると、また同じことになる。
+    #[test]
+    fn no_source_advises_fresh_without_out() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut checked = 0usize;
+        let mut dirs = vec![src];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src を読めること") {
+                let path = entry.expect("entry を読めること").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("読めること");
+                for (i, line) in text.lines().enumerate() {
+                    assert!(
+                        !(line.contains("build --fresh") && !line.contains("--out")),
+                        "{}:{} の案内に --out が無い。打つと失敗する: {}",
+                        path.display(),
+                        i + 1,
+                        line.trim()
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 5, "src を読めていない (見たファイル数 {checked})");
     }
 }
