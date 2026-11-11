@@ -123,12 +123,13 @@ fn add_json_payload(
     let owned = json_value_to_owned(value);
     // OwnedValue::Object でなければ無視 (payload は object 必須)
     if let OwnedValue::Object(_) = &owned {
-        doc.add_field_value(field, owned);
+        // 0.27 の `add_field_value` は `V: Value<'a>` を取る。`Value` を実装して
+        // いるのは `&OwnedValue` の側なので、参照で渡す。
+        doc.add_field_value(field, &owned);
     }
 }
 
 fn json_value_to_owned(v: &serde_json::Value) -> tantivy::schema::OwnedValue {
-    use std::collections::BTreeMap;
     use tantivy::schema::OwnedValue;
     match v {
         serde_json::Value::Null => OwnedValue::Null,
@@ -149,11 +150,15 @@ fn json_value_to_owned(v: &serde_json::Value) -> tantivy::schema::OwnedValue {
             OwnedValue::Array(arr.iter().map(json_value_to_owned).collect())
         }
         serde_json::Value::Object(map) => {
-            let mut out: BTreeMap<String, OwnedValue> = BTreeMap::new();
-            for (k, v) in map {
-                out.insert(k.clone(), json_value_to_owned(v));
-            }
-            OwnedValue::Object(out)
+            // 0.27 で `OwnedValue::Object` の中身が `BTreeMap` から
+            // `Vec<(String, OwnedValue)>` になった。serde_json::Map の反復は
+            // 既に決まった順（既定では挿入順、preserve_order なしなら辞書順）
+            // なので、そのまま詰めれば元と同じ並びになる。
+            OwnedValue::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), json_value_to_owned(v)))
+                    .collect(),
+            )
         }
     }
 }
@@ -496,18 +501,14 @@ fn collect_extracted_keys(
     Ok(out)
 }
 
-fn value_as_str(v: &tantivy::schema::OwnedValue) -> Option<&str> {
-    match v {
-        tantivy::schema::OwnedValue::Str(s) => Some(s.as_str()),
-        _ => None,
-    }
+/// 0.27 で `get_first` が返すのは `CompactDocValue` で、所有値ではない。
+/// `Value` 境界にしておけば `&OwnedValue` でも通るので、呼び出し側は変えずに済む。
+fn value_as_str<'a, V: tantivy::schema::Value<'a>>(v: V) -> Option<&'a str> {
+    v.as_str()
 }
 
-fn value_as_u64(v: &tantivy::schema::OwnedValue) -> Option<u64> {
-    match v {
-        tantivy::schema::OwnedValue::U64(n) => Some(*n),
-        _ => None,
-    }
+fn value_as_u64<'a, V: tantivy::schema::Value<'a>>(v: V) -> Option<u64> {
+    v.as_u64()
 }
 
 #[cfg(test)]
