@@ -15,7 +15,7 @@ services:
     command: ["xdf-mcp", "--index", "/index", "--http", "0.0.0.0:8765"]
     ports:
       # loopback だけに出す。LAN からは直接届かない。
-      # 経緯: hp-mini-ws/docs/view-security-axes.md の軸 0
+      # 入口はホスト側のリバースプロキシに寄せている（運用メモは別リポジトリ）。
       # Funnel（:443）は tailscaled が localhost:8765 を指すので届く。
       # コンテナ内の --http 0.0.0.0:8765 はそのまま（port mapping の受け口）。
       - "${HTTP_BIND_IP:-127.0.0.1}:${HTTP_PORT:-8765}:8765"
