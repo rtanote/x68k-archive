@@ -260,7 +260,11 @@ impl Pick {
     }
 }
 
-/// 名前の一覧に対して [`Pick`] の規則を適用する。検査用。
+/// 名前の一覧に対して [`Pick`] の規則を適用する。
+///
+/// 検査専用。走査する側は [`Pick`] を直接使うので、こちらは通らない。
+/// 規則そのものは [`Pick`] にあるので、ここを通して検査しても同じことを見ている。
+#[cfg(test)]
 fn choose_member(names: &[String], target: &str) -> Option<(usize, NameMatch)> {
     let mut pick = Pick::default();
     for (i, n) in names.iter().enumerate() {

@@ -96,8 +96,11 @@ pub fn staleness_note(found: u32) -> Option<String> {
     Some(format!(
         "索引は paths v{found} の規則で作られています (このビルドは v{PATHS_VERSION})。\n\
          LZH 内のサブディレクトリにあるファイルは、パスにディレクトリが入って\n\
-         いないため曖昧です。`xdf-index build --fresh` で作り直してください\n\
-         (summaries/ は消えません)。"
+         いないため曖昧です。次で作り直してください (summaries/ は消えません)。\n\
+         \n\
+         \x20   xdf-index build --fresh --out <索引のパス> <アーカイブのパス>\n\
+         \n\
+         --out とアーカイブのパスは省略できません。"
     ))
 }
 
@@ -187,6 +190,11 @@ mod tests {
         assert!(staleness_note(PATHS_VERSION).is_none());
         assert!(staleness_note(PATHS_VERSION + 1).is_none(), "進んでいる索引には何も言わない");
         let note = staleness_note(1).expect("v1 には注意を出す");
-        assert!(note.contains("--fresh"), "何をすればよいか書いてあること: {note}");
+        // そのまま打てる形であること。build は archive_dir と --out が必須で、
+        // `--fresh` だけ書くと「引数が足りない」で失敗する。案内が失敗する
+        // コマンドを教えていては、印を入れた意味がない。
+        for must in ["xdf-index build", "--fresh", "--out", "アーカイブのパス"] {
+            assert!(note.contains(must), "案内に {must} が無い: {note}");
+        }
     }
 }
