@@ -189,11 +189,10 @@ fn collect_existing_image_ids(
     Ok(ids)
 }
 
-fn value_as_str(v: &tantivy::schema::OwnedValue) -> Option<&str> {
-    match v {
-        tantivy::schema::OwnedValue::Str(s) => Some(s.as_str()),
-        _ => None,
-    }
+/// 0.27 で `get_first` が返すのは `CompactDocValue` で、所有値ではない。
+/// `Value` 境界にしておけば `&OwnedValue` でも通るので、呼び出し側は変えずに済む。
+fn value_as_str<'a, V: tantivy::schema::Value<'a>>(v: V) -> Option<&'a str> {
+    v.as_str()
 }
 
 fn clear_index_dir(dir: &Path) -> Result<()> {

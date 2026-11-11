@@ -20,7 +20,7 @@ use std::ops::Bound;
 use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
-use tantivy::schema::{IndexRecordOption, OwnedValue};
+use tantivy::schema::IndexRecordOption;
 use tantivy::{Index, ReloadPolicy, TantivyDocument, Term};
 
 /// プリセットビュー
@@ -148,7 +148,9 @@ pub fn run_query<P: AsRef<Path>>(index_dir: P, opts: &QueryOpts) -> Result<Query
 
     // 取得は post-filter のため少し多めに引いておく (limit*4、上限 50000)
     let prefetch = opts.limit.saturating_mul(4).clamp(opts.limit, 50_000);
-    let top_docs = searcher.search(&*query, &TopDocs::with_limit(prefetch))?;
+    // 0.27 の `TopDocs` はビルダーで、それ自身は `Collector` ではない。
+    // スコア順のコレクタは `order_by_score()` が返す。
+    let top_docs = searcher.search(&*query, &TopDocs::with_limit(prefetch).order_by_score())?;
 
     // ロード + post-filter
     let mut rows: Vec<RowExtracted> = Vec::with_capacity(top_docs.len());
@@ -227,20 +229,16 @@ fn build_tantivy_query(schema: &ArchiveSchema, opts: &QueryOpts) -> Result<Box<d
         Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
     ));
 
-    // issue_no 範囲。tantivy 0.22 は `RangeQuery::new_u64_bounds(field_name, lower, upper)`
+    // issue_no 範囲。0.22 は `RangeQuery::new_u64_bounds(field_name, lower, upper)`
+    // だったが、0.27 は `RangeQuery::new(Bound<Term>, Bound<Term>)` になった。
+    // 境界は値ではなく `Term` で表すので、フィールド名の文字列ではなく
+    // schema の `Field` から組む（名前の打ち間違いが型で防げるようにもなった）。
     let min = opts.filters.issue_no_min.unwrap_or(0);
     let max = opts.filters.issue_no_max.unwrap_or(u64::MAX);
     if opts.filters.issue_no_min.is_some() || opts.filters.issue_no_max.is_some() {
-        let lower = Bound::Included(min);
-        let upper = Bound::Included(max);
-        clauses.push((
-            Occur::Must,
-            Box::new(RangeQuery::new_u64_bounds(
-                "issue_no".to_string(),
-                lower,
-                upper,
-            )),
-        ));
+        let lower = Bound::Included(Term::from_field_u64(schema.issue_no, min));
+        let upper = Bound::Included(Term::from_field_u64(schema.issue_no, max));
+        clauses.push((Occur::Must, Box::new(RangeQuery::new(lower, upper))));
     }
 
     // issue_kind ("all" は無指定扱い)
@@ -303,41 +301,43 @@ fn extract_row(schema: &ArchiveSchema, doc: &TantivyDocument) -> RowExtracted {
 
 /// `OwnedValue::Object` を再帰的に flat なドット記法に展開する。
 /// 配列は最初の要素のみ拾う (ペイロード要件: タイトル等はスカラー、files も alias なので OK)。
-fn flatten_owned_value(prefix: &str, v: &OwnedValue, out: &mut HashMap<String, String>) {
-    match v {
-        OwnedValue::Object(map) => {
-            for (k, vv) in map.iter() {
-                let key = if prefix.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{}.{}", prefix, k)
-                };
-                flatten_owned_value(&key, vv, out);
-            }
+/// 0.27 では variant を直に match できない（`get_first` が返すのは
+/// `CompactDocValue`）。`Value` のアクセサで辿る形にした。容れ物を先に見るのは
+/// 元の match の並びと同じ意図で、Object / Array は再帰し、葉だけ文字列にする。
+fn flatten_owned_value<'a, V: tantivy::schema::Value<'a>>(
+    prefix: &str,
+    v: V,
+    out: &mut HashMap<String, String>,
+) {
+    if let Some(obj) = v.as_object() {
+        for (k, vv) in obj {
+            let key = if prefix.is_empty() {
+                k.to_string()
+            } else {
+                format!("{}.{}", prefix, k)
+            };
+            flatten_owned_value(&key, vv, out);
         }
-        OwnedValue::Str(s) => {
-            out.insert(prefix.to_string(), s.clone());
+        return;
+    }
+    if let Some(arr) = v.as_array() {
+        // 配列は要素を `key.0`, `key.1`, ... にする
+        for (i, item) in arr.enumerate() {
+            flatten_owned_value(&format!("{}.{}", prefix, i), item, out);
         }
-        OwnedValue::U64(n) => {
-            out.insert(prefix.to_string(), n.to_string());
-        }
-        OwnedValue::I64(n) => {
-            out.insert(prefix.to_string(), n.to_string());
-        }
-        OwnedValue::F64(n) => {
-            out.insert(prefix.to_string(), n.to_string());
-        }
-        OwnedValue::Bool(b) => {
-            out.insert(prefix.to_string(), b.to_string());
-        }
-        OwnedValue::Array(arr) => {
-            // 配列は要素を `key.0`, `key.1`, ... にする
-            for (i, item) in arr.iter().enumerate() {
-                let key = format!("{}.{}", prefix, i);
-                flatten_owned_value(&key, item, out);
-            }
-        }
-        _ => {}
+        return;
+    }
+    // 葉。Null / Bytes / Date などは元の `_ => {}` と同じく落とす。
+    if let Some(s) = v.as_str() {
+        out.insert(prefix.to_string(), s.to_string());
+    } else if let Some(n) = v.as_u64() {
+        out.insert(prefix.to_string(), n.to_string());
+    } else if let Some(n) = v.as_i64() {
+        out.insert(prefix.to_string(), n.to_string());
+    } else if let Some(n) = v.as_f64() {
+        out.insert(prefix.to_string(), n.to_string());
+    } else if let Some(b) = v.as_bool() {
+        out.insert(prefix.to_string(), b.to_string());
     }
 }
 
@@ -398,17 +398,13 @@ fn format_row(row: &RowExtracted, view: MetadataView) -> Vec<String> {
         .collect()
 }
 
-fn value_as_str(v: &OwnedValue) -> Option<&str> {
-    match v {
-        OwnedValue::Str(s) => Some(s.as_str()),
-        _ => None,
-    }
+/// 0.27 で `get_first` が返すのは `CompactDocValue` で、所有値ではない。
+/// `Value` 境界にしておけば `&OwnedValue` でも通るので、呼び出し側は変えずに済む。
+fn value_as_str<'a, V: tantivy::schema::Value<'a>>(v: V) -> Option<&'a str> {
+    v.as_str()
 }
-fn value_as_u64(v: &OwnedValue) -> Option<u64> {
-    match v {
-        OwnedValue::U64(n) => Some(*n),
-        _ => None,
-    }
+fn value_as_u64<'a, V: tantivy::schema::Value<'a>>(v: V) -> Option<u64> {
+    v.as_u64()
 }
 
 #[cfg(test)]
@@ -466,13 +462,17 @@ mod tests {
 
     #[test]
     fn flatten_object_payload() {
-        use std::collections::BTreeMap;
-        let mut inner: BTreeMap<String, OwnedValue> = BTreeMap::new();
-        inner.insert("doc".into(), OwnedValue::Str("MUSIC/SONGA.DOC".into()));
-        let mut outer: BTreeMap<String, OwnedValue> = BTreeMap::new();
-        outer.insert("title".into(), OwnedValue::Str("SONGA".into()));
-        outer.insert("files".into(), OwnedValue::Object(inner));
-        let v = OwnedValue::Object(outer);
+        // 0.27 で `OwnedValue::Object` は `Vec<(String, OwnedValue)>`。
+        // この検査はキー引きなので、並びは元の BTreeMap 版と関係ない。
+        use tantivy::schema::OwnedValue;
+        let inner = OwnedValue::Object(vec![(
+            "doc".into(),
+            OwnedValue::Str("MUSIC/SONGA.DOC".into()),
+        )]);
+        let v = OwnedValue::Object(vec![
+            ("title".into(), OwnedValue::Str("SONGA".into())),
+            ("files".into(), inner),
+        ]);
         let mut m = HashMap::new();
         flatten_owned_value("", &v, &mut m);
         assert_eq!(m.get("title").map(|s| s.as_str()), Some("SONGA"));

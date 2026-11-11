@@ -59,7 +59,10 @@ impl Searcher {
         }
         let combined = self.build_query(&opts)?;
         let searcher = self.reader.searcher();
-        let top_docs = searcher.search(&*combined, &TopDocs::with_limit(opts.limit))?;
+        // 0.27 の `TopDocs` はビルダーで、それ自身は `Collector` ではない。
+        // スコア順のコレクタは `order_by_score()` が返す。
+        let top_docs =
+            searcher.search(&*combined, &TopDocs::with_limit(opts.limit).order_by_score())?;
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, addr) in top_docs {
             let doc: TantivyDocument = searcher.doc(addr)?;
@@ -146,21 +149,14 @@ fn doc_to_hit(schema: &ArchiveSchema, doc: &TantivyDocument, score: f32) -> Hit 
     }
 }
 
-fn value_as_str(v: &tantivy::schema::OwnedValue) -> Option<&str> {
-    match v {
-        tantivy::schema::OwnedValue::Str(s) => Some(s.as_str()),
-        _ => None,
-    }
+/// 0.27 で `get_first` が返すのは `CompactDocValue` で、所有値ではない。
+/// `Value` 境界にしておけば `&OwnedValue` でも通るので、呼び出し側は変えずに済む。
+fn value_as_str<'a, V: tantivy::schema::Value<'a>>(v: V) -> Option<&'a str> {
+    v.as_str()
 }
-fn value_as_u64(v: &tantivy::schema::OwnedValue) -> Option<u64> {
-    match v {
-        tantivy::schema::OwnedValue::U64(n) => Some(*n),
-        _ => None,
-    }
+fn value_as_u64<'a, V: tantivy::schema::Value<'a>>(v: V) -> Option<u64> {
+    v.as_u64()
 }
-fn value_as_i64(v: &tantivy::schema::OwnedValue) -> Option<i64> {
-    match v {
-        tantivy::schema::OwnedValue::I64(n) => Some(*n),
-        _ => None,
-    }
+fn value_as_i64<'a, V: tantivy::schema::Value<'a>>(v: V) -> Option<i64> {
+    v.as_i64()
 }
