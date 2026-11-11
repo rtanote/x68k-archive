@@ -13,10 +13,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::{
         CallToolResult, ContentBlock, Implementation, InitializeRequestParams, ProtocolVersion,
-        ServerCapabilities, ServerInfo,
+        ServerCapabilities, ServerConfig,
     },
     schemars,
     service::RequestContext,
@@ -95,6 +95,12 @@ struct Args {
     ///
     /// 本サーバのツールは全て単発のリクエスト / レスポンスで、サーバ起点の通知も
     /// 再開 (resumability) も使っていないため、セッションを持つ必要がない。
+    ///
+    /// なお rmcp 3.x 以降、この指定が効くのは **MCP 仕様 2026-07-28 より前の版を
+    /// 交渉してきたクライアントだけ**。その版でセッションが廃止された (SEP-2567)
+    /// ため、新しいクライアントは常に stateless で処理される。フラグ名は
+    /// 互換のため変えていない。
+    ///
     /// 環境変数 `XDF_MCP_STATEFUL=1` でも有効化可。
     #[arg(long, env = "XDF_MCP_STATEFUL")]
     stateful: bool,
@@ -361,7 +367,6 @@ struct XdfMcpServer {
     /// 例: `https://host.example.ts.net/<secret>` → `<prefix>/downloads/<uuid>.zip`。
     /// None なら download_url は空文字列を返す (stdio モード等)。
     download_url_prefix: Arc<Option<String>>,
-    tool_router: ToolRouter<XdfMcpServer>,
 }
 
 #[tool_router]
@@ -377,7 +382,6 @@ impl XdfMcpServer {
             index_dir,
             extract_dir,
             download_url_prefix,
-            tool_router: Self::tool_router(),
         }
     }
 
@@ -605,7 +609,7 @@ impl XdfMcpServer {
 
 #[tool_handler]
 impl ServerHandler for XdfMcpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // 注: Implementation::from_build_env() は rmcp 自身の crate 名を返してしまうので
         // env! は呼び出し側 (xdf-mcp) で展開する必要がある。Implementation::new(...) +
         // builder メソッドで構築する (struct は #[non_exhaustive])。
@@ -622,7 +626,7 @@ impl ServerHandler for XdfMcpServer {
         // トランスポートで serve しながらこれを名乗るのは整合しない。ここでは
         // 既定 (`ProtocolVersion::default()` = `LATEST`) を上限として提示し、
         // 実際に使う版は下の `initialize` でクライアントと擦り合わせる。
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(info)
             .with_instructions(
                 "MCP server exposing X68000 disk image archives (XDF/HDS/HDF) via full-text \
@@ -648,7 +652,7 @@ impl ServerHandler for XdfMcpServer {
         &self,
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<ServerInfo, McpError> {
+    ) -> Result<ServerConfig, McpError> {
         let client_version = request.protocol_version.clone();
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
@@ -1234,14 +1238,20 @@ async fn run_http(
     //   古い ID を握ったままのクライアントに 404 (プレーンテキスト) を返し続けることになる。
     // - stateless では SSE の枠を外して素の application/json を返せる
     //   (MCP Streamable HTTP 仕様 2025-06-18 で許可)。プロキシ越しでの取り回しも良い。
+    // rmcp 3.x で `with_stateful_mode` は `with_legacy_session_mode` になった。
+    // 改名だけではない: MCP 仕様 2026-07-28 (SEP-2567) でセッションそのものが
+    // 廃止され、この設定は**それより古い版を交渉してきたクライアントにしか
+    // 効かない**。2026-07-28 以降を使うクライアントは、ここが true でも
+    // stateless で処理される。
     let mut config = StreamableHttpServerConfig::default()
         .with_cancellation_token(cancel.child_token())
-        .with_stateful_mode(stateful)
+        .with_legacy_session_mode(stateful)
         .with_json_response(!stateful);
     eprintln!(
         "xdf-mcp: Streamable HTTP mode = {}",
         if stateful {
-            "stateful (Mcp-Session-Id required; sessions are lost on restart)"
+            "legacy session mode (Mcp-Session-Id for pre-2026-07-28 clients; \
+sessions are lost on restart)"
         } else {
             "stateless (plain JSON responses)"
         }
