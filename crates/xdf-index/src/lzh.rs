@@ -222,25 +222,53 @@ fn match_member_name(name_norm: &str, target: &str) -> NameMatch {
     NameMatch::No
 }
 
-/// メンバー名の一覧から、`target` に対して返すべきものを選ぶ。
+/// どのメンバーを返すかの規則。走査しながら使える形にしてある。
 ///
-/// **完全一致はアーカイブ全体を見てから決める。** 出てきた順に 1 回だけ見る
-/// 作りにすると、`src/foo.c` が root の `foo.c` より前にあるとき、`foo.c` の
-/// 要求にベース名一致の方を返してしまう。作り直した索引でも間違ったファイルを
-/// 返すことになるので、ここは妥協できない。
+/// 規則は 2 つだけ。
 ///
-/// 優先順位の規則をこの関数だけに置いているのは、実アーカイブを用意せずに
-/// 検査できるようにするため。
-fn choose_member(names: &[String], target: &str) -> Option<(usize, NameMatch)> {
-    let mut base_only: Option<usize> = None;
-    for (i, n) in names.iter().enumerate() {
-        match match_member_name(n, target) {
-            NameMatch::Full => return Some((i, NameMatch::Full)),
-            NameMatch::BaseOnly if base_only.is_none() => base_only = Some(i),
-            _ => {}
+/// 1. **完全一致が出たらその場で確定。** アーカイブの残りは見ない。後ろに
+///    壊れたヘッダがあっても、手前の正しいメンバーは読めるようにするため。
+///    索引側も壊れた手前までは採っているので、読み出しもそれに揃える。
+/// 2. **完全一致が無いときだけ、最初のベース名候補。** 候補は走査中に覚えて
+///    おき、完全一致が無いと確定してから使う。1 周で早押しすると、
+///    `src/foo.c` が root の `foo.c` より前にあるとき `foo.c` の要求に
+///    ベース名一致を返してしまう（作り直した索引でも間違う）。
+///
+/// 実装をこの型だけに置いているのは、[`extract_member`] の走査と検査の両方が
+/// 同じ規則を使うようにするため。2 箇所に書くとずれる。
+#[derive(Default)]
+struct Pick {
+    base_only: Option<usize>,
+}
+
+impl Pick {
+    /// このメンバーで確定するなら `true`。`false` なら走査を続ける。
+    fn offer(&mut self, index: usize, m: NameMatch) -> bool {
+        match m {
+            NameMatch::Full => true,
+            NameMatch::BaseOnly if self.base_only.is_none() => {
+                self.base_only = Some(index);
+                false
+            }
+            _ => false,
         }
     }
-    base_only.map(|i| (i, NameMatch::BaseOnly))
+
+    /// 走査が終わった（または打ち切られた）ときの答え。
+    fn settle(&self) -> Option<usize> {
+        self.base_only
+    }
+}
+
+/// 名前の一覧に対して [`Pick`] の規則を適用する。検査用。
+fn choose_member(names: &[String], target: &str) -> Option<(usize, NameMatch)> {
+    let mut pick = Pick::default();
+    for (i, n) in names.iter().enumerate() {
+        if pick.offer(i, match_member_name(n, target)) {
+            return Some((i, NameMatch::Full));
+        }
+    }
+    pick.settle().map(|i| (i, NameMatch::BaseOnly))
 }
 
 /// ベース名での後退に入ったことを、プロセスにつき一度だけ伝える。
@@ -382,28 +410,9 @@ pub fn extract_member_nested(bytes: &[u8], inner_path: &str, max_depth: usize) -
     Ok(current)
 }
 
-/// ヘッダだけを辿ってメンバー名を順に集める。ディレクトリは飛ばす。
-/// 返る添字は [`read_member_at`] の添字と同じ数え方。
-fn member_names(bytes: &[u8]) -> Result<Vec<String>> {
-    let cursor = Cursor::new(bytes);
-    let mut reader = LhaDecodeReader::new(cursor)
-        .map_err(|e| anyhow!("LZH header parse failed: {}", e))?;
-    let mut out = Vec::new();
-    loop {
-        let header = reader.header().clone();
-        if !header.is_directory() {
-            out.push(decode_lzh_filename_from_header(&header).to_ascii_lowercase());
-        }
-        match reader.next_file() {
-            Ok(true) => continue,
-            Ok(false) => break,
-            Err(e) => return Err(anyhow!("LZH next_file error: {}", e)),
-        }
-    }
-    Ok(out)
-}
-
-/// [`member_names`] と同じ数え方の添字で、そのメンバーを展開する。
+/// ディレクトリを飛ばして数えた添字で、そのメンバーを展開する。
+///
+/// ベース名で後退したときにだけ使う。完全一致はその場で読むので通らない。
 fn read_member_at(bytes: &[u8], want: usize) -> Result<Vec<u8>> {
     let cursor = Cursor::new(bytes);
     let mut reader = LhaDecodeReader::new(cursor)
@@ -443,21 +452,56 @@ pub fn extract_member(bytes: &[u8], inner_path: &str) -> Result<Vec<u8>> {
     let target = inner_path.to_ascii_lowercase();
     let target = target.trim_start_matches('/').to_string();
 
-    // ヘッダだけを一周して名前を集める。中身は展開しないので安い。
-    // 完全一致を全体から探すために、選ぶ前に全員を見る必要がある。
-    let names = member_names(bytes)?;
-    let (want_index, how) = choose_member(&names, &target)
-        .ok_or_else(|| anyhow!("Member not found in LZH: {}", inner_path))?;
+    let cursor = Cursor::new(bytes);
+    let mut reader = LhaDecodeReader::new(cursor)
+        .map_err(|e| anyhow!("LZH header parse failed: {}", e))?;
+    let mut pick = Pick::default();
+    let mut i = 0usize;
+
+    loop {
+        let header = reader.header().clone();
+        if !header.is_directory() {
+            let name = decode_lzh_filename_from_header(&header);
+            let m = match_member_name(&name.to_ascii_lowercase(), &target);
+            if pick.offer(i, m) {
+                // 完全一致。ここで読んで返る。残りのヘッダは見ない。
+                if !reader.is_decoder_supported() {
+                    return Err(anyhow!("Unsupported compression for: {}", name));
+                }
+                let mut data = Vec::with_capacity(header.original_size as usize);
+                reader
+                    .read_to_end(&mut data)
+                    .map_err(|e| anyhow!("LZH decode error for {}: {}", name, e))?;
+                return Ok(data);
+            }
+            i += 1;
+        }
+        match reader.next_file() {
+            Ok(true) => continue,
+            Ok(false) => break,
+            Err(e) => {
+                // ヘッダが壊れている。ここより手前にベース名の候補があるなら、
+                // それで答える。索引は壊れた手前までのメンバーを持っているので、
+                // 読み出しだけ全滅させる理由がない。候補も無ければ諦める。
+                if pick.settle().is_none() {
+                    return Err(anyhow!("LZH next_file error: {}", e));
+                }
+                break;
+            }
+        }
+    }
 
     // paths v1 の索引はディレクトリ抜きのパスを持っている。完全一致が無いときに
     // ベース名で拾うのは、索引を作り直していない利用者が pull した瞬間に
     // 読めなくならないようにするため。曖昧さは残るが、それは v1 索引での
     // 従来の挙動と同じで退行ではない。
-    if how == NameMatch::BaseOnly {
-        warn_stale_index_once();
+    match pick.settle() {
+        Some(idx) => {
+            warn_stale_index_once();
+            read_member_at(bytes, idx)
+        }
+        None => Err(anyhow!("Member not found in LZH: {}", inner_path)),
     }
-
-    read_member_at(bytes, want_index)
 }
 
 #[cfg(test)]
@@ -631,6 +675,33 @@ mod tests {
         // 候補が複数あるときは先に出てきた方（v1 索引での従来の挙動）
         let dup = vec!["b/foo.c".to_string(), "a/foo.c".to_string()];
         assert_eq!(choose_member(&dup, "foo.c"), Some((0, NameMatch::BaseOnly)));
+    }
+
+    #[test]
+    fn exact_match_settles_immediately() {
+        // 「完全一致が出たら残りは見ない」の核。後ろに壊れたヘッダがあっても
+        // 手前の正しいメンバーが読めるのは、offer が true を返して走査が
+        // 止まるからで、ここが崩れるとその性質も崩れる。
+        let mut pick = Pick::default();
+        assert!(
+            pick.offer(0, NameMatch::Full),
+            "完全一致はその場で確定すること"
+        );
+
+        // ベース名候補は確定させない（完全一致が後ろにあるかもしれない）
+        let mut pick = Pick::default();
+        assert!(!pick.offer(0, NameMatch::BaseOnly));
+        assert_eq!(pick.settle(), Some(0));
+        // 候補は最初のものだけ覚える
+        assert!(!pick.offer(1, NameMatch::BaseOnly));
+        assert_eq!(pick.settle(), Some(0));
+    }
+
+    #[test]
+    fn no_match_never_settles() {
+        let mut pick = Pick::default();
+        assert!(!pick.offer(0, NameMatch::No));
+        assert_eq!(pick.settle(), None);
     }
 
     #[test]
