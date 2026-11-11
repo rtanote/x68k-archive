@@ -97,7 +97,12 @@ pub fn build_index<A: AsRef<Path>, I: AsRef<Path>>(
         }
     }
 
-    writer.commit()?;
+    // 索引に「どの版の規則で作ったか」を刻む。公開リポジトリなので、
+    // バイナリだけ更新して索引を作り直さなかった利用者が気づけるように。
+    // 置き場は tantivy が使わない IndexMeta.payload（crate::index_version）。
+    let mut prepared = writer.prepare_commit()?;
+    prepared.set_payload(&crate::index_version::current_payload());
+    prepared.commit()?;
     Ok(stats)
 }
 

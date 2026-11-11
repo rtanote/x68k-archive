@@ -197,6 +197,48 @@ fn add_member_document(
     Ok(1)
 }
 
+/// 索引のパス (`target`) と LZH メンバー名の照合結果。
+#[derive(Debug, PartialEq, Eq)]
+enum NameMatch {
+    /// パスが丸ごと一致した。paths v2 の索引で起きる。
+    Full,
+    /// ベース名だけ一致した。paths v1 の索引 (ディレクトリ抜き) で起きる。
+    /// 同名が複数あると取り違えうるので、呼び出し側は警告を出す。
+    BaseOnly,
+    No,
+}
+
+/// 照合を関数に出してあるのは、実アーカイブを用意せずに検査できるようにする
+/// ため。`LhaHeader` は外から組み立てられないので、ヘッダ経由では検査できない。
+fn match_member_name(name_norm: &str, target: &str) -> NameMatch {
+    if name_norm == target || name_norm.trim_start_matches('/') == target {
+        return NameMatch::Full;
+    }
+    // ディレクトリを持つ名前に限る。持たない名前は上で判定が終わっていて、
+    // ここに来るのは「別のファイル」なので、ベース名を見る意味がない。
+    if name_norm.contains('/') && name_norm.rsplit('/').next() == Some(target) {
+        return NameMatch::BaseOnly;
+    }
+    NameMatch::No
+}
+
+/// ベース名での後退に入ったことを、プロセスにつき一度だけ伝える。
+///
+/// 毎回出すと、索引全体を走るような使い方でログが埋まる。知りたいのは
+/// 「この索引は作り直しが必要」という一点なので、一度で足りる。
+fn warn_stale_index_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "warning: LZH メンバーをベース名で引き当てました。索引が \
+             paths v1 (ディレクトリ抜き) で作られている可能性があります。\n\
+             同名ファイルが複数ある場合、別のファイルの内容が返ることがあります。\n\
+             `xdf-index build --fresh` で作り直してください。"
+        );
+    }
+}
+
 /// LZH ヘッダからファイル名 (UTF-8 文字列) を取得。
 ///
 /// **ディレクトリ部分と SJIS の両方を保つ必要がある。**
@@ -337,7 +379,18 @@ pub fn extract_member(bytes: &[u8], inner_path: &str) -> Result<Vec<u8>> {
         if !header.is_directory() {
             let name = decode_lzh_filename_from_header(header);
             let name_norm = name.to_ascii_lowercase();
-            if name_norm == target || name_norm.trim_start_matches('/') == target {
+            // paths v1 の索引はディレクトリ抜きのパスを持っている。完全一致で
+            // 見つからないときはベース名でも拾う。これが無いと、索引を作り直して
+            // いない利用者が pull した瞬間に、サブディレクトリにあるメンバーを
+            // 読めなくなる。
+            //
+            // 後退した側では同名衝突の曖昧さが残る（先に出てきた方を返す）が、
+            // それは v1 索引での従来の挙動と同じで、退行ではない。
+            let m = match_member_name(&name_norm, &target);
+            if m == NameMatch::BaseOnly {
+                warn_stale_index_once();
+            }
+            if m != NameMatch::No {
                 if !reader.is_decoder_supported() {
                     return Err(anyhow!("Unsupported compression for: {}", name));
                 }
@@ -486,6 +539,36 @@ mod tests {
 
     /// 索引側の既定深度と、読み出し側が想定する深度が揃っていること。
     /// ここがずれると「索引には載っているのに読めない」ドキュメントが生まれる。
+    #[test]
+    fn full_path_matches_exactly() {
+        assert_eq!(match_member_name("src/foo.c", "src/foo.c"), NameMatch::Full);
+        assert_eq!(match_member_name("foo.c", "foo.c"), NameMatch::Full);
+        // 先頭のスラッシュは無視する（従来からの挙動）
+        assert_eq!(match_member_name("/foo.c", "foo.c"), NameMatch::Full);
+    }
+
+    #[test]
+    fn base_name_falls_back_for_v1_indexes() {
+        // paths v1 の索引は "foo.c" しか持っていない。v2 のコードが
+        // "src/foo.c" を作っても、読み出しが失敗しないこと。
+        assert_eq!(match_member_name("src/foo.c", "foo.c"), NameMatch::BaseOnly);
+        assert_eq!(
+            match_member_name("a/b/deep.txt", "deep.txt"),
+            NameMatch::BaseOnly
+        );
+    }
+
+    #[test]
+    fn base_name_fallback_does_not_match_unrelated_files() {
+        // 別物を拾わないこと。ここが緩いと、存在しないパスの要求に対して
+        // 無関係なファイルを返してしまう。
+        assert_eq!(match_member_name("src/foo.c", "bar.c"), NameMatch::No);
+        assert_eq!(match_member_name("foo.c", "src/foo.c"), NameMatch::No);
+        assert_eq!(match_member_name("srcfoo.c", "foo.c"), NameMatch::No);
+        // ディレクトリを持たない名前は後退の対象にしない
+        assert_eq!(match_member_name("foo.c", "o.c"), NameMatch::No);
+    }
+
     #[test]
     fn index_default_depth_is_two() {
         assert_eq!(

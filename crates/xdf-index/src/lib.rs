@@ -8,6 +8,7 @@ pub mod dennou;
 pub mod document;
 pub mod extract;
 pub mod grouping;
+pub mod index_version;
 pub mod lzh;
 pub mod metadata;
 pub mod schema;
