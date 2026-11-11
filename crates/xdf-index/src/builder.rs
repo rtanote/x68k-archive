@@ -97,7 +97,20 @@ pub fn build_index<A: AsRef<Path>, I: AsRef<Path>>(
         }
     }
 
-    writer.commit()?;
+    // 索引に「どの版の規則で作ったか」を刻む。公開リポジトリなので、
+    // バイナリだけ更新して索引を作り直さなかった利用者が気づけるように。
+    // 置き場は tantivy が使わない IndexMeta.payload（crate::index_version）。
+    //
+    // **刻むのは索引を丸ごと作り直したときだけ。** 増分ビルドは既存イメージを
+    // 飛ばすので、飛ばした分は古い規則のまま残る。そこで新しい版を刻むと、
+    // 作り直しが要る索引が「新しい」と名乗り、status も MCP も警告を出さなく
+    // なる。元が空だった場合は全部が今回の規則で入るので、刻んでよい。
+    let rebuilt_everything = opts.fresh || existing_ids.is_empty();
+    if rebuilt_everything {
+        crate::index_version::commit_stamped(&mut writer)?;
+    } else {
+        crate::index_version::commit_preserving(&index, &mut writer)?;
+    }
     Ok(stats)
 }
 

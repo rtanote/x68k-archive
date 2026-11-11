@@ -240,6 +240,17 @@ fn main() -> Result<()> {
             let summarized =
                 xdf_index::summary::list_summarized_ids(&index).unwrap_or_default();
             println!("  summaries: {}", summarized.len());
+            // 索引の作り方の版。作り直しが要るなら、ここで理由ごと伝える。
+            match xdf_index::index_version::read_paths_version_at(&index) {
+                Some(v) => {
+                    println!("  paths: v{v}");
+                    if let Some(note) = xdf_index::index_version::staleness_note(v) {
+                        println!();
+                        println!("{note}");
+                    }
+                }
+                None => println!("  paths: 不明 (索引のメタを読めませんでした)"),
+            }
         }
         Cmd::Summarize {
             archive_dir,

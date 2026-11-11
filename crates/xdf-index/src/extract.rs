@@ -293,7 +293,11 @@ pub fn extract_archive(
         }
     }
 
-    writer.commit().context("Failed to commit extraction writes")?;
+    // 素の commit だと payload が持ち越されず、索引の版の印が消える。
+    // 作り直した直後に extract を走らせると v1 と判定され、また作り直しを
+    // 促すことになる。抽出は索引の一部を書き換えるだけなので、印は保つ。
+    crate::index_version::commit_preserving(&index, &mut writer)
+        .context("Failed to commit extraction writes")?;
     Ok(stats)
 }
 

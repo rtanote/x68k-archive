@@ -133,7 +133,9 @@ pub fn run_query<P: AsRef<Path>>(index_dir: P, opts: &QueryOpts) -> Result<Query
     if !ArchiveSchema::has_structured_fields(&index.schema()) {
         return Err(anyhow!(
             "Index at {:?} lacks structured fields. \
-             Rebuild with `xdf-index build --fresh` then run `xdf-index extract`.",
+             Rebuild with `xdf-index build --fresh --out {:?} <archive_dir>` \
+             then run `xdf-index extract`.",
+            index_dir.as_ref(),
             index_dir.as_ref()
         ));
     }
