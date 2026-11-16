@@ -11,6 +11,11 @@
 //!   2. payload を `serde_json::Value` で取り出し、`submitter_contains` などは
 //!      **Rust の `String::contains` で post-filter** する。
 //! 想定スケール (数千レコード) では十分実用的で、形態素解析の依存を増やさずに済む。
+//!
+//! **これは「この層の」判断であって、本文 (`body`) のトークン化の話ではない。**
+//! 本文側は別の問題を抱えていた (既定アナライザが長い日本語を丸ごと捨てる) ので、
+//! そちらは `analyzer.rs` を参照。この注記を「索引全体に日本語の分割が無い」と
+//! 読まれたことがあるため、区別を明示しておく。
 
 use crate::schema::ArchiveSchema;
 use anyhow::{anyhow, Result};
@@ -21,7 +26,7 @@ use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, RangeQuery, TermQuery};
 use tantivy::schema::IndexRecordOption;
-use tantivy::{Index, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{ReloadPolicy, TantivyDocument, Term};
 
 /// プリセットビュー
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,7 +134,7 @@ pub struct QueryResult {
 /// 索引にクエリを実行して行を返す
 pub fn run_query<P: AsRef<Path>>(index_dir: P, opts: &QueryOpts) -> Result<QueryResult> {
     let schema = ArchiveSchema::build();
-    let index = Index::open_in_dir(index_dir.as_ref())?;
+    let index = crate::analyzer::open_in_dir(index_dir.as_ref())?;
     if !ArchiveSchema::has_structured_fields(&index.schema()) {
         return Err(anyhow!(
             "Index at {:?} lacks structured fields. \

@@ -6,6 +6,7 @@
 //!   xdf-index status --index ~/.xdf-fs/index
 
 use anyhow::Result;
+use tantivy::tokenizer::TokenStream;
 use clap::{Parser, Subcommand};
 use xdf_index::anthropic::MODEL_SONNET;
 use xdf_index::builder::{build_index, BuildOpts};
@@ -30,6 +31,17 @@ struct Args {
 enum Cmd {
     /// スキーマ情報を表示
     SchemaInfo,
+    /// アナライザがテキストをどう切るかを見る (索引を触らない)
+    ///
+    /// 日本語の取りこぼしを調べる計測器。既定アナライザが長い日本語を
+    /// 丸ごと捨てるのを、この出力で直接確かめられる。
+    Tokenize {
+        /// 切ってみたいテキスト
+        text: String,
+        /// アナライザ名 (既定: 登録済みすべて)
+        #[arg(long)]
+        analyzer: Option<String>,
+    },
     /// アーカイブディレクトリから索引を構築 (増分)
     Build {
         archive_dir: std::path::PathBuf,
@@ -185,6 +197,34 @@ fn main() -> Result<()> {
             println!("xdf-index schema fields:");
             for (_, fe) in s.schema.fields() {
                 println!("  {}", fe.name());
+            }
+        }
+        Cmd::Tokenize { text, analyzer } => {
+            // 登録済みアナライザを引くために、空スキーマの索引を 1 つ作る。
+            let index =
+                xdf_index::analyzer::create_in_ram(tantivy::schema::Schema::builder().build());
+            let names: Vec<&str> = match analyzer.as_deref() {
+                Some(n) => vec![n],
+                None => vec!["default", xdf_index::analyzer::NGRAM_TOKENIZER],
+            };
+            println!("input : {text:?} ({} bytes)", text.len());
+            for name in names {
+                let Some(mut a) = index.tokenizers().get(name) else {
+                    eprintln!("{name:<10}: (未登録)");
+                    continue;
+                };
+                let mut stream = a.token_stream(&text);
+                let mut toks = Vec::new();
+                while stream.advance() {
+                    let t = stream.token();
+                    toks.push(format!("{}@{}", t.text, t.position));
+                }
+                if toks.is_empty() {
+                    // 既定アナライザが長い日本語を捨てるのがまさにこれ。
+                    println!("{name:<10}: (トークンなし = 索引に入らない)");
+                } else {
+                    println!("{name:<10}: {}", toks.join(" "));
+                }
             }
         }
         Cmd::Build {

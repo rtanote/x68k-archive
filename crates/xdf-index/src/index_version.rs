@@ -49,7 +49,10 @@ pub fn read_paths_version(index: &Index) -> u32 {
 
 /// 索引ディレクトリを開いて版を読む。開けなければ `None`。
 pub fn read_paths_version_at(index_dir: &Path) -> Option<u32> {
-    Index::open_in_dir(index_dir).ok().as_ref().map(read_paths_version)
+    crate::analyzer::open_in_dir(index_dir)
+        .ok()
+        .as_ref()
+        .map(read_paths_version)
 }
 
 /// 現在の版を刻んで commit する。
@@ -127,7 +130,7 @@ mod tests {
         use tantivy::schema::{Schema, TEXT};
         let mut sb = Schema::builder();
         sb.add_text_field("t", TEXT);
-        let index = Index::create_in_ram(sb.build());
+        let index = crate::analyzer::create_in_ram(sb.build());
         let mut writer: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
         match payload {
             Some(p) => {

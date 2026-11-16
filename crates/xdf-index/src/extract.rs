@@ -5,6 +5,7 @@
 //!
 //! 設計: `docs/additional_spec/design.md`「電脳倶楽部スキーマプラグイン」参照。
 
+use crate::analyzer;
 use crate::builder::{compute_image_id, discover_images};
 use crate::schema::ArchiveSchema;
 use anyhow::{anyhow, Context, Result};
@@ -452,8 +453,7 @@ fn open_index_for_extract(index_dir: &Path, schema: &ArchiveSchema) -> Result<In
     std::fs::create_dir_all(index_dir)
         .with_context(|| format!("Cannot create index dir {:?}", index_dir))?;
     let index = if index_dir.join("meta.json").exists() {
-        let idx = Index::open_in_dir(index_dir)
-            .with_context(|| format!("Cannot open index at {:?}", index_dir))?;
+        let idx = analyzer::open_in_dir(index_dir)?;
         let stored = idx.schema();
         if !ArchiveSchema::has_structured_fields(&stored) {
             return Err(anyhow!(
@@ -465,7 +465,7 @@ fn open_index_for_extract(index_dir: &Path, schema: &ArchiveSchema) -> Result<In
         }
         idx
     } else {
-        Index::create_in_dir(index_dir, schema.schema.clone())?
+        analyzer::create_in_dir(index_dir, schema.schema.clone())?
     };
     Ok(index)
 }

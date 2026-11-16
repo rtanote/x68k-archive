@@ -2,6 +2,7 @@
 //!
 //! tantivy を使って複数の XDF / HDS / HDF にまたがるメタ + 本文索引を構築・検索する。
 
+pub mod analyzer;
 pub mod anthropic;
 pub mod builder;
 pub mod dennou;
