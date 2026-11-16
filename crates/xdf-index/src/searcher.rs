@@ -7,7 +7,15 @@ use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, Schema};
-use tantivy::{IndexReader, ReloadPolicy, TantivyDocument, Term};
+use tantivy::snippet::SnippetGenerator;
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
+
+/// ヒット箇所まわりの抜粋に出す最大文字数。
+///
+/// tantivy の既定は 150 文字。日本語 1 文だと短すぎて何の話か分からないので
+/// 少し広げている。一方で広げすぎると MCP のレスポンスが膨らむ
+/// (`archive_search` は既定 20 件返す)。
+pub const SNIPPET_CHARS: usize = 240;
 
 /// 検索オプション。`query` 空 + `ext` 空はエラー、`ext` のみで全件絞り込み可。
 #[derive(Debug, Clone, Default)]
@@ -103,14 +111,22 @@ pub struct Searcher {
 
 impl Searcher {
     pub fn open<P: AsRef<Path>>(index_dir: P) -> Result<Self> {
-        let index = analyzer::open_in_dir(index_dir.as_ref())?;
+        Self::from_index(&analyzer::open_in_dir(index_dir.as_ref())?)
+    }
+
+    /// 既に開いた索引から作る。
+    ///
+    /// `open` はディレクトリから開くので、RAM 索引を使うテストから呼べない。
+    /// 実体はこちらに置き、`open` は「開いて渡すだけ」にしてある。
+    /// **索引は `analyzer` 経由で開いたものを渡すこと** (トークナイザの登録が要る)。
+    pub fn from_index(index: &Index) -> Result<Self> {
         let fields = ReadFields::resolve(&index.schema())?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
         // デフォルトの検索対象フィールド: 本文 + ファイル名
-        let parser = QueryParser::for_index(&index, fields.query_fields.clone());
+        let parser = QueryParser::for_index(index, fields.query_fields.clone());
         Ok(Self {
             fields,
             reader,
@@ -139,6 +155,23 @@ impl Searcher {
         }
         let combined = self.build_query(&opts)?;
         let searcher = self.reader.searcher();
+
+        // 抜粋をヒット箇所から切り出すための生成器。
+        //
+        // クエリが空 (拡張子だけで一覧する用法) のときは中心にする箇所が無いので
+        // 作らない。作れなかった場合も黙って先頭からの抜粋に落とす — 抜粋のために
+        // 検索自体を失敗させる価値はない。
+        let snippets = if opts.query.trim().is_empty() {
+            None
+        } else {
+            SnippetGenerator::create(&searcher, &*combined, self.fields.body)
+                .ok()
+                .map(|mut g| {
+                    g.set_max_num_chars(SNIPPET_CHARS);
+                    g
+                })
+        };
+
         // 0.27 の `TopDocs` はビルダーで、それ自身は `Collector` ではない。
         // スコア順のコレクタは `order_by_score()` が返す。
         let top_docs =
@@ -146,7 +179,7 @@ impl Searcher {
         let mut hits = Vec::with_capacity(top_docs.len());
         for (score, addr) in top_docs {
             let doc: TantivyDocument = searcher.doc(addr)?;
-            hits.push(doc_to_hit(&self.fields, &doc, score));
+            hits.push(doc_to_hit(&self.fields, &doc, score, snippets.as_ref()));
         }
         Ok(hits)
     }
@@ -206,7 +239,17 @@ pub struct Hit {
     pub excerpt: String,
 }
 
-fn doc_to_hit(fields: &ReadFields, doc: &TantivyDocument, score: f32) -> Hit {
+/// 1 ヒット分の `Hit` を組み立てる。
+///
+/// `snippets` が `Some` ならヒット箇所まわりを抜粋に使う。`None` のとき
+/// (クエリが空、生成器を作れなかった) と、切り出せなかったとき
+/// (旧索引で本文が STORED でない) は本文の先頭からに落とす。
+fn doc_to_hit(
+    fields: &ReadFields,
+    doc: &TantivyDocument,
+    score: f32,
+    snippets: Option<&SnippetGenerator>,
+) -> Hit {
     let get_str = |f| {
         doc.get_first(f)
             .and_then(value_as_str)
@@ -215,11 +258,21 @@ fn doc_to_hit(fields: &ReadFields, doc: &TantivyDocument, score: f32) -> Hit {
     };
     let get_u64 = |f| doc.get_first(f).and_then(value_as_u64).unwrap_or(0);
     let get_i64 = |f| doc.get_first(f).and_then(value_as_i64).unwrap_or(0);
-    // 抜粋は STORED 本文から切り出す。旧索引には専用の `body_excerpt` があるので
-    // そちらに落とす (バイナリだけ上げた利用者の見え方を変えないため)。
-    let excerpt = match doc.get_first(fields.body).and_then(value_as_str) {
-        Some(text) if !text.is_empty() => make_excerpt(text, EXCERPT_BYTES),
-        _ => fields.legacy_excerpt.map(get_str).unwrap_or_default(),
+    // 抜粋は 3 段で落とす:
+    //   1. ヒット箇所まわり (本文が STORED で、クエリがあるとき)
+    //   2. 本文の先頭から (クエリが空のとき = 拡張子だけで一覧する用法)
+    //   3. 旧索引の `body_excerpt` (本文が STORED でないとき。バイナリだけ
+    //      上げた利用者の見え方を変えないため)
+    let from_snippet = snippets
+        .map(|g| g.snippet_from_doc(doc))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.fragment().to_string());
+    let excerpt = match from_snippet {
+        Some(s) => s,
+        None => match doc.get_first(fields.body).and_then(value_as_str) {
+            Some(text) if !text.is_empty() => make_excerpt(text, EXCERPT_BYTES),
+            _ => fields.legacy_excerpt.map(get_str).unwrap_or_default(),
+        },
     };
     Hit {
         score,
@@ -328,7 +381,7 @@ mod tests {
         let long = "あ".repeat(2000); // 6000 バイト
         let mut doc = TantivyDocument::default();
         doc.add_text(f.body, &long);
-        let hit = doc_to_hit(&f, &doc, 1.0);
+        let hit = doc_to_hit(&f, &doc, 1.0, None);
         assert_eq!(hit.excerpt, make_excerpt(&long, EXCERPT_BYTES));
         assert!(hit.excerpt.len() <= EXCERPT_BYTES, "上限を超えないこと");
     }
@@ -346,8 +399,80 @@ mod tests {
             f.legacy_excerpt.expect("旧スキーマには在る"),
             "旧索引の抜粋",
         );
-        let hit = doc_to_hit(&f, &doc, 1.0);
+        let hit = doc_to_hit(&f, &doc, 1.0, None);
         assert_eq!(hit.excerpt, "旧索引の抜粋");
+    }
+
+    /// 実スキーマの RAM 索引に 1 文書だけ入れた `Searcher`。
+    fn ram_searcher(body: &str) -> Searcher {
+        let s = ArchiveSchema::build();
+        let index = crate::analyzer::create_in_ram(s.schema.clone());
+        let mut w: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+        let mut doc = TantivyDocument::default();
+        doc.add_text(s.image_path, "/archive/sample.img");
+        doc.add_text(s.image_id, "0123456789abcdef");
+        doc.add_u64(s.partition, 0);
+        doc.add_text(s.file_path, "DOCS/SAMPLE.DOC");
+        doc.add_text(s.file_name, "SAMPLE.DOC");
+        doc.add_text(s.ext, "DOC");
+        doc.add_u64(s.size, body.len() as u64);
+        doc.add_i64(s.mtime, 0);
+        doc.add_text(s.attr, "----A--");
+        doc.add_text(s.body_ngram, body);
+        w.add_document(doc).unwrap();
+        w.commit().unwrap();
+        Searcher::from_index(&index).unwrap()
+    }
+
+    /// 冒頭が飾りで、探す語が後ろの方にある本文。
+    ///
+    /// 実物の `.DOC` は冒頭が罫線や枠で、**旧 `body_excerpt` はそこだけを
+    /// 返していた**。この形でないと「ヒット箇所に寄った」ことを確認できない。
+    fn body_with_needle_late(needle: &str) -> String {
+        let rule = "―".repeat(60);
+        format!(
+            "{rule}\n{}\n{needle}\n{}",
+            "ほかの話題".repeat(40),
+            "続きの話".repeat(40)
+        )
+    }
+
+    #[test]
+    fn excerpt_is_centred_on_the_match() {
+        let needle = "音源ドライバの常駐";
+        let s = ram_searcher(&body_with_needle_late(needle));
+        let hits = s.search(needle, 5).unwrap();
+        assert_eq!(hits.len(), 1, "1 件ヒットすること");
+        let ex = &hits[0].excerpt;
+        assert!(ex.contains("音源"), "ヒット箇所を含むこと: {ex}");
+        assert!(
+            !ex.starts_with('―'),
+            "冒頭の飾りを返していないこと (これが直したかったこと): {ex}"
+        );
+        let n = ex.chars().count();
+        assert!(
+            n <= SNIPPET_CHARS * 2,
+            "長さが抑えられていること ({n} 文字)"
+        );
+    }
+
+    /// 拡張子だけの一覧では中心にする箇所が無いので、先頭からに落ちること。
+    #[test]
+    fn ext_only_search_falls_back_to_the_head() {
+        let s = ram_searcher(&body_with_needle_late("音源ドライバの常駐"));
+        let hits = s
+            .search_with(SearchOpts {
+                query: String::new(),
+                ext: vec!["DOC".into()],
+                limit: 5,
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].excerpt.starts_with('―'),
+            "クエリが無いときは先頭からの抜粋であること: {}",
+            hits[0].excerpt
+        );
     }
 
     /// フィールドを足しても序数で壊れないこと = この修正の本題。

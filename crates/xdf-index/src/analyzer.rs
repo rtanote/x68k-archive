@@ -48,8 +48,6 @@
 //!   46 → 48 件に上がり、**他文書へのヒットは増えなかった** (37 件で同数)。
 //!   代償は `東京・大阪` が `京大` という偽の隣接を作ること。2 文字クエリで
 //!   まれに出るが、カタカナ製品名が主役のこの資料群では利得が大きいと判断した
-//! - **オフセットは NFKC 後のテキスト基準**。元バイト列とはズレる。
-//!   将来 `SnippetGenerator` でハイライトする場合はここが問題になる
 //!
 //! ## 句読点で位置を飛ばす必要が無い理由
 //!
@@ -64,6 +62,8 @@ use tantivy::tokenizer::{
     LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenStream, Tokenizer,
 };
 use tantivy::Index;
+use unicode_normalization::char::canonical_combining_class;
+use unicode_normalization::UnicodeNormalization;
 
 /// 文字 bigram アナライザの登録名。スキーマの `set_tokenizer` と必ず一致させる。
 pub const NGRAM_TOKENIZER: &str = "ja_bigram";
@@ -104,33 +104,100 @@ const INTERPUNCT: char = '・';
 /// 「ディスク・ユーティリティ」を「ディスクユーティリティ」として索引する。
 /// 索引側とクエリ側で同じ処理が走るので、`・` のあり/なしが対称になる。
 /// 行頭の箇条書き `・` は直前が CJK ではないので落ちない。
-fn elide_interpuncts(cs: Vec<(usize, char)>) -> Vec<(usize, char)> {
-    let mut out = Vec::with_capacity(cs.len());
-    for (i, &(off, c)) in cs.iter().enumerate() {
-        let sandwiched = c == INTERPUNCT
-            && i > 0
-            && is_cjk(cs[i - 1].1)
-            && cs.get(i + 1).map(|&(_, n)| is_cjk(n)).unwrap_or(false);
-        if !sandwiched {
-            out.push((off, c));
-        }
-    }
-    out
+fn elide_interpuncts(cs: Vec<NormChar>) -> Vec<NormChar> {
+    let keep: Vec<bool> = cs
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let sandwiched = n.ch == INTERPUNCT
+                && i > 0
+                && is_cjk(cs[i - 1].ch)
+                && cs.get(i + 1).map(|x| is_cjk(x.ch)).unwrap_or(false);
+            !sandwiched
+        })
+        .collect();
+    cs.into_iter()
+        .zip(keep)
+        .filter_map(|(n, k)| if k { Some(n) } else { None })
+        .collect()
 }
 
 /// CJK を重なり bigram に、それ以外の語を塊のまま切り出すトークナイザ。
 #[derive(Clone, Default)]
 pub struct JaBigramTokenizer;
 
+/// 直前のグループに「くっつく」文字か。
+///
+/// NFKC は直前の starter と合成するので、**1 文字ずつ正規化してはいけない**
+/// (`ﾊ` + `ﾞ` が `バ` にならない)。どこまでを 1 グループにするかの判定。
+///
+/// 本筋は**正準結合クラス** (`ccc != 0` = non-starter)。これを見ないと、
+/// かなの濁点だけを特別扱いして `A` + U+030A (結合リング) を取りこぼし、
+/// 丸ごと NFKC すれば `Å` になるものが `A` と結合文字に分かれてしまう。
+/// 半角カナの濁点 (U+FF9E/FF9F) は `ccc` が 0 なのに合成されるので足す。
+///
+/// **残る差**: ハングルの字母合成 (LV + T) は starter 同士なので合成されない。
+/// SJIS 由来の本文には出ず、クエリでも現実的に来ないため許容している。
+fn attaches_to_previous(c: char) -> bool {
+    canonical_combining_class(c) != 0 || matches!(c, '\u{FF9E}' | '\u{FF9F}')
+}
+
+/// NFKC 後の 1 文字と、それを生んだ**元テキスト**のバイト範囲。
+struct NormChar {
+    ch: char,
+    orig_start: usize,
+    orig_end: usize,
+}
+
+/// 元テキストを NFKC しつつ、各文字が元のどのバイト範囲から来たかを保つ。
+///
+/// **`Token` の `offset_from`/`offset_to` は元テキストの範囲でなければならない**
+/// (`&text[offset_from..offset_to]` が有効な文字列であること)。NFKC はバイト長を
+/// 変える (`ＺＭＳ` 9B → `ZMS` 3B、`㍿` 3B → `株式会社` 12B) ので、正規化後の
+/// 位置をそのまま入れると元テキストの文字境界を割る。
+///
+/// 実際に `SnippetGenerator` がそこで slice してパニックした
+/// (`start byte index N is not a char boundary`)。トークン文字列と
+/// オフセットの指す範囲は長さが違ってよい (ステミング等と同じ)。
+fn normalize_with_offsets(text: &str) -> Vec<NormChar> {
+    let mut out: Vec<NormChar> = Vec::with_capacity(text.len() / 2);
+    let mut group = String::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        let mut end = start + c.len_utf8();
+        group.clear();
+        group.push(c);
+        // 続く結合文字・濁点類は同じグループに入れる (合成のため)
+        while let Some(&(ns, nc)) = chars.peek() {
+            if !attaches_to_previous(nc) {
+                break;
+            }
+            group.push(nc);
+            end = ns + nc.len_utf8();
+            chars.next();
+        }
+        // 1 グループが複数文字に展開されることもある (`㍿` → `株式会社`)。
+        // その場合は全員が同じ元範囲を指す。
+        for nc in group.nfkc() {
+            out.push(NormChar {
+                ch: nc,
+                orig_start: start,
+                orig_end: end,
+            });
+        }
+    }
+    out
+}
+
 /// [`JaBigramTokenizer`] のトークン列。
 ///
-/// NFKC 正規化した**自前のテキストを所有する**。借用しないのは、NFKC が
+/// NFKC 正規化した**自前の文字列を所有する**。借用しないのは、NFKC が
 /// 文字数を変える (`㍿` → `株式会社`) うえ半角カナの濁点を合成するため、
 /// 正規化を**トークン化より前**に済ませる必要があるから。
 /// `TokenFilter` では境界が決まった後しか触れず、この順序を作れない。
 pub struct JaBigramTokenStream {
-    /// NFKC 後のテキストの (バイト位置, 文字)。bigram は 1 文字先読みが要る。
-    cs: Vec<(usize, char)>,
+    /// NFKC 後の文字と、元テキスト上の位置。bigram は 1 文字先読みが要る。
+    cs: Vec<NormChar>,
     /// 次に見る `cs` の添字
     i: usize,
     token: Token,
@@ -140,11 +207,10 @@ impl Tokenizer for JaBigramTokenizer {
     type TokenStream<'a> = JaBigramTokenStream;
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> JaBigramTokenStream {
-        let norm = crate::text_norm::nfkc(text);
         let mut token = Token::default();
         token.reset();
         JaBigramTokenStream {
-            cs: elide_interpuncts(norm.char_indices().collect()),
+            cs: elide_interpuncts(normalize_with_offsets(text)),
             i: 0,
             token,
         }
@@ -153,7 +219,7 @@ impl Tokenizer for JaBigramTokenizer {
 
 impl JaBigramTokenStream {
     fn char_at(&self, i: usize) -> Option<char> {
-        self.cs.get(i).map(|&(_, c)| c)
+        self.cs.get(i).map(|n| n.ch)
     }
 
     fn is_cjk_at(&self, i: usize) -> bool {
@@ -165,13 +231,14 @@ impl JaBigramTokenStream {
     }
 
     /// `cs[from..=to]` を現在のトークンに書き出す。
+    ///
+    /// **オフセットは元テキストの範囲**。トークン文字列の長さとは一致しない
+    /// (NFKC で縮んだり伸びたりする)。
     fn emit(&mut self, from: usize, to: usize) {
-        let (start, _) = self.cs[from];
-        let (last_off, last_c) = self.cs[to];
-        self.token.offset_from = start;
-        self.token.offset_to = last_off + last_c.len_utf8();
+        self.token.offset_from = self.cs[from].orig_start;
+        self.token.offset_to = self.cs[to].orig_end;
         for k in from..=to {
-            self.token.text.push(self.cs[k].1);
+            self.token.text.push(self.cs[k].ch);
         }
     }
 }
@@ -456,18 +523,88 @@ mod tests {
         assert_eq!(texts(NGRAM_TOKENIZER, &ok).len(), 1, "39 バイトは残す");
     }
 
-    #[test]
-    fn offsets_point_at_the_normalized_text() {
+    /// オフセットと位置を全部集める。
+    fn spans(text: &str) -> Vec<(String, usize, usize)> {
         let index = create_in_ram(tantivy::schema::Schema::builder().build());
         let mut analyzer = index.tokenizers().get(NGRAM_TOKENIZER).unwrap();
-        let mut stream = analyzer.token_stream("音声合成");
-        assert!(stream.advance());
-        let t = stream.token();
-        assert_eq!(
-            (t.offset_from, t.offset_to),
-            (0, 6),
-            "最初の bigram は 0..6 バイト"
-        );
+        let mut stream = analyzer.token_stream(text);
+        let mut out = Vec::new();
+        while stream.advance() {
+            let t = stream.token();
+            out.push((t.text.clone(), t.offset_from, t.offset_to));
+        }
+        out
+    }
+
+    /// **グループ単位の正規化が、丸ごと NFKC したものと一致すること。**
+    ///
+    /// オフセットを保つためにグループ単位で正規化しているので、グループの
+    /// 切り方を間違えると合成が壊れる。かなの濁点だけを特別扱いしていた間は
+    /// `A` + 結合リング が `Å` にならず `A` と結合文字に分かれていた
+    /// (丸ごと NFKC すれば `Å`)。SJIS 由来の本文には結合文字は出ないが、
+    /// **クエリは任意の UTF-8 で来る**ので索引側とクエリ側がずれる。
+    ///
+    /// 既知の差はハングルの字母合成 (LV + T) だけ。starter 同士なので
+    /// グループが分かれる。この資料群では現実的に来ないため許容している。
+    #[test]
+    fn group_normalization_matches_whole_string_nfkc() {
+        for text in [
+            "ＺＭＳファイル",
+            "ﾊﾞｲﾄとﾊﾞｯﾌｧ",
+            "㍿の略記",
+            "A\u{030A}ngstrom",     // 結合リング: 丸ごとなら Å
+            "か\u{3099}き\u{309A}", // 結合濁点・半濁点
+            "e\u{0301}\u{0327}",    // 結合文字が 2 つ (並べ替えが起きる)
+            "音声合成／ＰＣＭ８・ＡＤＰＣＭ",
+        ] {
+            let got: String = normalize_with_offsets(text).iter().map(|n| n.ch).collect();
+            assert_eq!(
+                got,
+                crate::text_norm::nfkc(text),
+                "グループ単位の正規化が丸ごとと一致しない: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn offsets_point_at_the_original_text() {
+        // 正規化で変わらない入力なら、そのままの位置
+        assert_eq!(spans("音声合成")[0], ("音声".to_string(), 0, 6));
+
+        // **全角は NFKC で縮むが、オフセットは元テキストの範囲を指す。**
+        // `ＺＭＳ` は元で 9 バイト、トークンは `zms` の 3 バイト。
+        assert_eq!(spans("ＺＭＳ"), vec![("zms".to_string(), 0, 9)]);
+
+        // 半角カナ + 濁点は 2 文字 (6 バイト) が 1 文字に合成される。
+        // 最初の bigram `バイ` は元の `ﾊﾞｲ` = 9 バイト分。
+        assert_eq!(spans("ﾊﾞｲﾄ")[0], ("バイ".to_string(), 0, 9));
+    }
+
+    /// **オフセットで元テキストを slice してもパニックしないこと。**
+    ///
+    /// `Token` の契約は「`&text[offset_from..offset_to]` が有効な文字列」。
+    /// 正規化後の位置を入れていた間は `SnippetGenerator` がここで
+    /// `start byte index N is not a char boundary` で落ちた。
+    /// 合成テストでは境界にたまたま乗って通ってしまい、**実データで初めて出た**。
+    #[test]
+    fn offsets_always_slice_the_original_text() {
+        for text in [
+            "ＺＭＳファイルは音源ドライバで使う",
+            "ﾊﾞｲﾄ数とﾊﾞｯﾌｧの話。全角もＡＢＣ混在",
+            "㍿の略記と、ディスク・ユーティリティ",
+            "音声合成／ＰＣＭ８・ＡＤＰＣＭ",
+            "PCM8使用で重い。ＦＭ音源は軽い",
+        ] {
+            for (tok, from, to) in spans(text) {
+                assert!(
+                    text.is_char_boundary(from) && text.is_char_boundary(to),
+                    "トークン {tok:?} のオフセット {from}..{to} が文字境界でない: {text:?}"
+                );
+                assert!(to <= text.len(), "範囲外: {from}..{to} / {}", text.len());
+                // 実際に slice してみる (ここでパニックしていた)
+                let _ = &text[from..to];
+            }
+        }
     }
 
     /// 登録漏れを防ぐ。`Index::*_in_*` はこのモジュールの中だけで呼ぶ。

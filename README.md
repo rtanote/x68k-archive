@@ -176,6 +176,8 @@ xdf-index query --index ~/.xdf-fs/index                          # CSV / JSON �
 ```
 
 検索結果は `score / image:partition:path / size / 拡張子 / 抜粋` の形式で出力。
+**抜粋はヒット箇所まわりを切り出したもの**で、ファイル先頭ではない
+(X68000 の `.DOC` は冒頭が罫線や枠なので、先頭だと判断材料にならない)。
 本文索引対象は `.DOC` `.TXT` `.ZMS` `.BAS` `.X` `.S` `.C` `.H` 等。
 
 #### 日本語の検索
