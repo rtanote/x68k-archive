@@ -42,6 +42,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # コミットメッセージも検査するので履歴が要る (既定は shallow clone)。
+          fetch-depth: 0
 
       # 公開してはいけないものが混入していないかの回帰検査。
       #
@@ -78,10 +81,21 @@ jobs:
           fi
 
       # 個人環境の識別子 (ホスト名 / tailnet 名 / プライベート IP /
-      # 実ユーザのホームパス / メールアドレス) が公開ファイルに混入していないこと。
+      # 実ユーザのホームパス / メールアドレス) が混入していないこと。
       # 具体的な固有名はスクリプト側にも書かない (書くと一覧になってしまう)。
+      #
+      # **追跡ファイルとコミットメッセージの両方を見る。** 以前、ファイルだけ
+      # 綺麗でメッセージに環境情報が残る状態になった (スクリプトがメッセージを
+      # 見ていなかった)。メッセージは PR 画面と `git log` に残り、force push
+      # しても到達不能オブジェクトとして読めるので、push 前に止めたい。
       - name: no private identifiers
-        run: ./check-identifiers.sh
+        run: |
+          if [ -n "${{ github.base_ref }}" ]; then
+            git fetch -q --no-tags origin "${{ github.base_ref }}"
+            ./check-identifiers.sh "origin/${{ github.base_ref }}..HEAD"
+          else
+            ./check-identifiers.sh "HEAD~1..HEAD"
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
         with:
