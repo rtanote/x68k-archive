@@ -1,6 +1,7 @@
 //! 索引クエリ実行 (T-3.4)
 
 use crate::analyzer;
+use crate::document::{make_excerpt, EXCERPT_BYTES};
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use tantivy::collector::TopDocs;
@@ -38,7 +39,10 @@ struct ReadFields {
     ext: Field,
     size: Field,
     mtime: Field,
-    body_excerpt: Field,
+    /// 本文。新スキーマでは STORED なので、抜粋はここから切り出す
+    body: Field,
+    /// 旧索引の `body_excerpt`。新スキーマには無い (本文の重複だったので廃止)
+    legacy_excerpt: Option<Field>,
     /// 既定の検索対象。**索引に実在するものだけ**を入れる。
     query_fields: Vec<Field>,
 }
@@ -60,17 +64,18 @@ impl ReadFields {
         };
         let file_name = f("file_name")?;
 
-        let mut query_fields: Vec<Field> = BODY_FIELD_CANDIDATES
+        let bodies: Vec<Field> = BODY_FIELD_CANDIDATES
             .iter()
             .filter_map(|n| schema.get_field(n).ok())
             .collect();
-        if query_fields.is_empty() {
-            return Err(anyhow!(
+        let body = *bodies.first().ok_or_else(|| {
+            anyhow!(
                 "索引に本文フィールド ({}) がありません。{}",
                 BODY_FIELD_CANDIDATES.join(" / "),
                 crate::index_version::REBUILD_HOWTO
-            ));
-        }
+            )
+        })?;
+        let mut query_fields = bodies;
         query_fields.push(file_name);
 
         Ok(Self {
@@ -82,7 +87,9 @@ impl ReadFields {
             ext: f("ext")?,
             size: f("size")?,
             mtime: f("mtime")?,
-            body_excerpt: f("body_excerpt")?,
+            body,
+            // 旧索引にしか無いので、無くても失敗にしない
+            legacy_excerpt: schema.get_field("body_excerpt").ok(),
             query_fields,
         })
     }
@@ -208,6 +215,12 @@ fn doc_to_hit(fields: &ReadFields, doc: &TantivyDocument, score: f32) -> Hit {
     };
     let get_u64 = |f| doc.get_first(f).and_then(value_as_u64).unwrap_or(0);
     let get_i64 = |f| doc.get_first(f).and_then(value_as_i64).unwrap_or(0);
+    // 抜粋は STORED 本文から切り出す。旧索引には専用の `body_excerpt` があるので
+    // そちらに落とす (バイナリだけ上げた利用者の見え方を変えないため)。
+    let excerpt = match doc.get_first(fields.body).and_then(value_as_str) {
+        Some(text) if !text.is_empty() => make_excerpt(text, EXCERPT_BYTES),
+        _ => fields.legacy_excerpt.map(get_str).unwrap_or_default(),
+    };
     Hit {
         score,
         image_path: get_str(fields.image_path),
@@ -218,7 +231,7 @@ fn doc_to_hit(fields: &ReadFields, doc: &TantivyDocument, score: f32) -> Hit {
         ext: get_str(fields.ext),
         size: get_u64(fields.size),
         mtime: get_i64(fields.mtime),
-        excerpt: get_str(fields.body_excerpt),
+        excerpt,
     }
 }
 
@@ -303,6 +316,40 @@ mod tests {
         );
     }
 
+    /// 抜粋が STORED 本文から切り出されること。
+    ///
+    /// 旧 `body_excerpt` は本文の先頭 2048 バイトそのものだったので、本文が
+    /// STORED になった時点で完全な重複になり廃止した。**出力を変えない**のが
+    /// 条件なのでここで縛る。将来誰かが本文を切り詰めて保存したら落ちる。
+    #[test]
+    fn excerpt_is_cut_from_the_stored_body() {
+        let s = schema_with_body(Some("body_ngram"));
+        let f = ReadFields::resolve(&s).unwrap();
+        let long = "あ".repeat(2000); // 6000 バイト
+        let mut doc = TantivyDocument::default();
+        doc.add_text(f.body, &long);
+        let hit = doc_to_hit(&f, &doc, 1.0);
+        assert_eq!(hit.excerpt, make_excerpt(&long, EXCERPT_BYTES));
+        assert!(hit.excerpt.len() <= EXCERPT_BYTES, "上限を超えないこと");
+    }
+
+    /// 旧索引では `body_excerpt` に落ちること。
+    ///
+    /// 旧スキーマの `body` は STORED ではないので doc から本文は取れない。
+    /// 索引を作り直さずバイナリだけ上げた利用者の見え方を変えないための経路。
+    #[test]
+    fn legacy_index_excerpt_comes_from_body_excerpt() {
+        let s = schema_with_body(Some("body"));
+        let f = ReadFields::resolve(&s).unwrap();
+        let mut doc = TantivyDocument::default();
+        doc.add_text(
+            f.legacy_excerpt.expect("旧スキーマには在る"),
+            "旧索引の抜粋",
+        );
+        let hit = doc_to_hit(&f, &doc, 1.0);
+        assert_eq!(hit.excerpt, "旧索引の抜粋");
+    }
+
     /// フィールドを足しても序数で壊れないこと = この修正の本題。
     ///
     /// 旧スキーマの索引に対して、**新しい** `ArchiveSchema` の序数をそのまま
@@ -330,6 +377,7 @@ mod tests {
         let s = sb.build();
         let f = ReadFields::resolve(&s).expect("並びが違っても解決できること");
         assert_eq!(f.image_path, s.get_field("image_path").unwrap());
-        assert_eq!(f.body_excerpt, s.get_field("body_excerpt").unwrap());
+        assert_eq!(f.body, s.get_field("body").unwrap());
+        assert_eq!(f.legacy_excerpt, s.get_field("body_excerpt").ok());
     }
 }

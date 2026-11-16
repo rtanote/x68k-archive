@@ -5,10 +5,7 @@
 //! - パスは `outer.lzh!/inner/file.zms` の形式 (JAR 慣習)
 //! - 再帰深度・サイズ上限あり (LZHボム対策)
 
-use crate::document::{
-    attr_str_from_dir_flag, build_document, decode_sjis_lossy, make_excerpt, DocFields,
-    EXCERPT_BYTES,
-};
+use crate::document::{attr_str_from_dir_flag, build_document, decode_sjis_lossy, DocFields};
 use crate::schema::{is_text_extension, ArchiveSchema};
 use anyhow::{anyhow, Result};
 use delharc::header::{LhaHeader, TimestampResult};
@@ -166,16 +163,11 @@ fn add_member_document(
         .to_ascii_uppercase();
     let attr = attr_str_from_dir_flag(false);
 
-    let (body_text, excerpt_text);
-    if is_text_extension(&ext) {
-        let text = decode_sjis_lossy(data);
-        let excerpt = make_excerpt(&text, EXCERPT_BYTES);
-        body_text = Some(text);
-        excerpt_text = Some(excerpt);
+    let body_text = if is_text_extension(&ext) {
+        Some(decode_sjis_lossy(data))
     } else {
-        body_text = None;
-        excerpt_text = None;
-    }
+        None
+    };
 
     let doc = build_document(
         schema,
@@ -190,7 +182,6 @@ fn add_member_document(
             mtime_unix,
             attr: &attr,
             body: body_text.as_deref(),
-            excerpt: excerpt_text.as_deref(),
         },
     );
     writer.add_document(doc)?;
