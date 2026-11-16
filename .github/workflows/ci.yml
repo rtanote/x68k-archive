@@ -91,9 +91,19 @@ jobs:
       - name: no private identifiers
         run: |
           if [ -n "${{ github.base_ref }}" ]; then
+            # PR: base..head で、この PR が持ち込む全コミットを見る。
             git fetch -q --no-tags origin "${{ github.base_ref }}"
             ./check-identifiers.sh "origin/${{ github.base_ref }}..HEAD"
+          elif git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
+            # push: **この更新に含まれる全コミット**を見る。`HEAD~1..HEAD` だと
+            # 複数コミットを一度に push したとき最後の 1 本しか見ず、手前の
+            # メッセージに識別子があっても通ってしまう (公開はされる)。
+            ./check-identifiers.sh "${{ github.event.before }}..${{ github.sha }}"
           else
+            # ブランチ作成 (before が 0 埋め) / force push で before を辿れない /
+            # workflow_dispatch。範囲を決められないので直近 1 本だけ見る。
+            # 作成時に大量に push した場合は取りこぼすが、通常の経路は PR なので
+            # そちらで既に全コミットを見ている。
             ./check-identifiers.sh "HEAD~1..HEAD"
           fi
 

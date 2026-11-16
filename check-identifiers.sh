@@ -67,7 +67,10 @@ ALLOW_RFC1918=''
 LABEL_HOMEDIR='実ユーザのホームディレクトリパス'
 PAT_HOMEDIR='/(home|Users)/[A-Za-z][A-Za-z0-9_-]*'
 # 許可: プレースホルダ表記のみ
-ALLOW_HOMEDIR='/home/<|/Users/<|/home/\$|/Users/\$|/home/USER|/Users/USER|yourname|youruser|your-name|/Users/me'
+# 除外は**語の境界まで**見る。`/Users/me` を入れていたら `/Users/megan` も
+# (大小無視なので) `/Users/Melissa` も素通りしていた。実在の名前を黙って
+# 許可するのが一番まずい。プレースホルダは `<...>` か `$...` で書くこと。
+ALLOW_HOMEDIR='/home/<|/Users/<|/home/\$|/Users/\$|/home/USER\b|/Users/USER\b|yourname\b|youruser\b|your-name\b'
 
 LABEL_EMAIL='メールアドレス'
 PAT_EMAIL='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
@@ -123,7 +126,13 @@ if [ -z "$RANGE" ]; then
 elif ! git rev-parse --verify -q "${RANGE%%..*}" >/dev/null 2>&1; then
   printf '注意: コミットメッセージの検査を飛ばした (%s を解決できない)\n' "${RANGE%%..*}"
 else
-  MSGS=$(git log --format='%h %s%n%b' "$RANGE" 2>/dev/null || true)
+  # **失敗と「0 件」を区別する。** `git log` が落ちた (head が無い等) のを
+  # 空の結果として扱うと、1 件も見ずに成功してしまう。
+  if ! MSGS=$(git log --format='%h %s%n%b' "$RANGE" 2>&1); then
+    printf '%s を読めませんでした:\n%s\n' "$RANGE" "$MSGS"
+    printf 'コミットメッセージを検査できていません。\n'
+    exit 1
+  fi
   if [ -z "$MSGS" ]; then
     printf 'コミットメッセージ: %s に対象なし\n' "$RANGE"
   else
