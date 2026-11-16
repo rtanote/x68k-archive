@@ -10,9 +10,21 @@
 #       代わりに「形」で検出し、意図的なプレースホルダと公開 ID だけを
 #       一般語の許可リストで除外する。
 #
+# **この検査が見られないもの (push 前に人が意味で見る必要がある)**
+#
+# 形に一致しないので素通りする。実際に全部やってしまったことがある。
+#
+#   1. 本番の規模・インフラの数値。索引の件数、サーバの空き容量、ストレージの
+#      種類など。環境固有だが形は持たない
+#   2. 所有ディスクイメージ名とその内部パス。何を持っているかを明示してしまう
+#   3. **アーカイブ本文の逐語引用。** 実測ログからのコピペが混入しやすい。
+#      テストのフィクスチャは**同じバイト長の合成文字列**を作ること。
+#      ただし実測結果の表に合成文字列を入れてはいけない (測定の捏造になる)。
+#      引用をやめて「長さと結果」の表にすれば情報量は落ちない
+#
 # 使い方:
-#   ./check-identifiers.sh          # 追跡ファイル全体を検査
-#   CI からも同じものを呼ぶ
+#   ./check-identifiers.sh                  # 追跡ファイル + origin/main..HEAD のメッセージ
+#   ./check-identifiers.sh <base>..<head>   # メッセージの範囲を明示 (CI 用)
 
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -33,46 +45,111 @@ report() {
 #                  対象に含めると必ず自分自身を検出してしまう (自己参照)。
 files() { git ls-files -- . ':!Cargo.lock' ':!check-identifiers.sh'; }
 
-# ---- 1. tailnet ホスト名 ----
+# ---- 検査項目 ----
+#
+# **ファイルとコミットメッセージの両方に同じものを当てる。**
+# 以前、ファイルだけ綺麗でメッセージに環境情報が残る状態になった
+# (スクリプトがメッセージを見ていなかった)。パターンを 1 箇所に置いて
+# 両方から使うことで、片方だけ直す事故を防ぐ。
+
+ITEMS=(TAILNET RFC1918 HOMEDIR EMAIL HOSTSHAPE CGNAT)
+
+LABEL_TAILNET='tailnet ホスト名らしき文字列'
+PAT_TAILNET='[A-Za-z0-9-]+\.ts\.net'
 # 許可: ドキュメント中の明示的なプレースホルダのみ (一般語)
-HITS=$(files | xargs -r grep -InE '[A-Za-z0-9-]+\.ts\.net' 2>/dev/null \
-  | grep -viE 'your-tailnet|\bexample\b|<tailnet>|<machine>|<host>|myhost' || true)
-[ -n "$HITS" ] && report "tailnet ホスト名らしき文字列" "$HITS"
+ALLOW_TAILNET='your-tailnet|\bexample\b|<tailnet>|<machine>|<host>|myhost'
 
-# ---- 2. RFC1918 プライベート IP ----
+LABEL_RFC1918='プライベート IP アドレス'
 # 127.0.0.1 / 0.0.0.0 / localhost は公開設定例として正当なので対象外。
-HITS=$(files | xargs -r grep -InE \
-  '\b(192\.168\.[0-9]{1,3}\.[0-9]{1,3}|10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3})\b' \
-  2>/dev/null || true)
-[ -n "$HITS" ] && report "プライベート IP アドレス" "$HITS"
+PAT_RFC1918='\b(192\.168\.[0-9]{1,3}\.[0-9]{1,3}|10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3})\b'
+ALLOW_RFC1918=''
 
-# ---- 3. 実ユーザのホームディレクトリパス ----
+LABEL_HOMEDIR='実ユーザのホームディレクトリパス'
+PAT_HOMEDIR='/(home|Users)/[A-Za-z][A-Za-z0-9_-]*'
 # 許可: プレースホルダ表記のみ
-HITS=$(files | xargs -r grep -InE '/(home|Users)/[A-Za-z][A-Za-z0-9_-]*' 2>/dev/null \
-  | grep -viE '/home/<|/Users/<|/home/\$|/Users/\$|/home/USER|/Users/USER|yourname|youruser|your-name|/Users/me' || true)
-[ -n "$HITS" ] && report "実ユーザのホームディレクトリパス" "$HITS"
+# 除外は**語の境界まで**見る。`/Users/me` を入れていたら `/Users/megan` も
+# (大小無視なので) `/Users/Melissa` も素通りしていた。実在の名前を黙って
+# 許可するのが一番まずい。プレースホルダは `<...>` か `$...` で書くこと。
+ALLOW_HOMEDIR='/home/<|/Users/<|/home/\$|/Users/\$|/home/USER\b|/Users/USER\b|yourname\b|youruser\b|your-name\b'
 
-# ---- 4. メールアドレス ----
+LABEL_EMAIL='メールアドレス'
+PAT_EMAIL='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
 # 許可: GitHub の noreply (公開 ID) と anthropic の noreply
-HITS=$(files | xargs -r grep -InE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' 2>/dev/null \
-  | grep -viE '@users\.noreply\.github\.com|noreply@anthropic\.com|@example\.(com|org|net)|user@host' || true)
-[ -n "$HITS" ] && report "メールアドレス" "$HITS"
+ALLOW_EMAIL='@users\.noreply\.github\.com|noreply@anthropic\.com|@example\.(com|org|net)|user@host'
 
-# ---- 5. 個人機のホスト名らしき形 ----
+LABEL_HOSTSHAPE='個人機のホスト名らしき文字列'
 # `<語>-<語>-ws` のような命名。サフィックスは機材を示す語に絞る
 # (`pc` や `host` は一般語に当たりすぎるため含めない)。
-HITS=$(files | xargs -r grep -InE '\b[a-z][a-z0-9]*-[a-z0-9]+-(ws|srv|nas)\b' 2>/dev/null || true)
-[ -n "$HITS" ] && report "個人機のホスト名らしき文字列" "$HITS"
+PAT_HOSTSHAPE='\b[a-z][a-z0-9]*-[a-z0-9]+-(ws|srv|nas)\b'
+ALLOW_HOSTSHAPE=''
 
-# ---- 6. Tailscale の IP レンジ (100.64.0.0/10 の CGNAT) ----
-HITS=$(files | xargs -r grep -InE '\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b' 2>/dev/null || true)
-[ -n "$HITS" ] && report "Tailscale (CGNAT) の IP アドレス" "$HITS"
+LABEL_CGNAT='Tailscale (CGNAT) の IP アドレス'
+PAT_CGNAT='\b100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}\b'
+ALLOW_CGNAT=''
+
+# 許可リストが空なら素通しする (空パターンの grep は全行に一致してしまう)。
+sift() {
+  local allow="$1"
+  if [ -n "$allow" ]; then
+    grep -viE "$allow" || true
+  else
+    cat
+  fi
+}
+
+scan_files() {
+  files | xargs -r grep -InE "$1" 2>/dev/null | sift "$2"
+}
+
+scan_text() {
+  grep -nE "$1" 2>/dev/null | sift "$2"
+}
+
+# ---- 追跡ファイル ----
+for item in "${ITEMS[@]}"; do
+  pat="PAT_$item"; allow="ALLOW_$item"; label="LABEL_$item"
+  HITS=$(scan_files "${!pat}" "${!allow}")
+  [ -n "$HITS" ] && report "追跡ファイル: ${!label}" "$HITS"
+done
+
+# ---- コミットメッセージ ----
+#
+# 公開されるのはファイルだけではない。メッセージは GitHub の PR 画面と
+# `git log` に残り、force push しても到達不能オブジェクトとして読める。
+RANGE="${1:-}"
+if [ -z "$RANGE" ] && git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+  RANGE='origin/main..HEAD'
+fi
+
+if [ -z "$RANGE" ]; then
+  printf '注意: コミットメッセージの検査を飛ばした (比較先が無い)\n'
+elif ! git rev-parse --verify -q "${RANGE%%..*}" >/dev/null 2>&1; then
+  printf '注意: コミットメッセージの検査を飛ばした (%s を解決できない)\n' "${RANGE%%..*}"
+else
+  # **失敗と「0 件」を区別する。** `git log` が落ちた (head が無い等) のを
+  # 空の結果として扱うと、1 件も見ずに成功してしまう。
+  if ! MSGS=$(git log --format='%h %s%n%b' "$RANGE" 2>&1); then
+    printf '%s を読めませんでした:\n%s\n' "$RANGE" "$MSGS"
+    printf 'コミットメッセージを検査できていません。\n'
+    exit 1
+  fi
+  if [ -z "$MSGS" ]; then
+    printf 'コミットメッセージ: %s に対象なし\n' "$RANGE"
+  else
+    for item in "${ITEMS[@]}"; do
+      pat="PAT_$item"; allow="ALLOW_$item"; label="LABEL_$item"
+      HITS=$(printf '%s\n' "$MSGS" | scan_text "${!pat}" "${!allow}")
+      [ -n "$HITS" ] && report "コミットメッセージ ($RANGE): ${!label}" "$HITS"
+    done
+  fi
+fi
 
 if [ "$FOUND" -ne 0 ]; then
-  printf '\n個人環境の識別子が公開ファイルに含まれています。\n'
+  printf '\n個人環境の識別子が含まれています。\n'
   printf 'プレースホルダ (例: <host>.<tailnet>.ts.net) に置き換えてください。\n'
   printf '意図的な記載であれば check-identifiers.sh の許可リストに\n'
   printf '一般語として追加してください (固有名そのものは書かないこと)。\n'
+  printf 'コミットメッセージ側で見つかった場合は、push 前なら履歴を作り直せます。\n'
   exit 1
 fi
 
