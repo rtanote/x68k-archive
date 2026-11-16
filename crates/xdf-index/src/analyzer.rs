@@ -62,6 +62,7 @@ use tantivy::tokenizer::{
     LowerCaser, RemoveLongFilter, TextAnalyzer, Token, TokenStream, Tokenizer,
 };
 use tantivy::Index;
+use unicode_normalization::char::canonical_combining_class;
 use unicode_normalization::UnicodeNormalization;
 
 /// 文字 bigram アナライザの登録名。スキーマの `set_tokenizer` と必ず一致させる。
@@ -125,12 +126,20 @@ fn elide_interpuncts(cs: Vec<NormChar>) -> Vec<NormChar> {
 #[derive(Clone, Default)]
 pub struct JaBigramTokenizer;
 
-/// 濁点・半濁点。
+/// 直前のグループに「くっつく」文字か。
 ///
-/// NFKC はこれを直前の文字と合成するので、**1 文字ずつ正規化してはいけない**
-/// (`ﾊ` + `ﾞ` が `バ` にならない)。グループにしてから渡す。
-fn is_voicing_mark(c: char) -> bool {
-    matches!(c, '\u{3099}' | '\u{309A}' | '\u{FF9E}' | '\u{FF9F}')
+/// NFKC は直前の starter と合成するので、**1 文字ずつ正規化してはいけない**
+/// (`ﾊ` + `ﾞ` が `バ` にならない)。どこまでを 1 グループにするかの判定。
+///
+/// 本筋は**正準結合クラス** (`ccc != 0` = non-starter)。これを見ないと、
+/// かなの濁点だけを特別扱いして `A` + U+030A (結合リング) を取りこぼし、
+/// 丸ごと NFKC すれば `Å` になるものが `A` と結合文字に分かれてしまう。
+/// 半角カナの濁点 (U+FF9E/FF9F) は `ccc` が 0 なのに合成されるので足す。
+///
+/// **残る差**: ハングルの字母合成 (LV + T) は starter 同士なので合成されない。
+/// SJIS 由来の本文には出ず、クエリでも現実的に来ないため許容している。
+fn attaches_to_previous(c: char) -> bool {
+    canonical_combining_class(c) != 0 || matches!(c, '\u{FF9E}' | '\u{FF9F}')
 }
 
 /// NFKC 後の 1 文字と、それを生んだ**元テキスト**のバイト範囲。
@@ -158,9 +167,9 @@ fn normalize_with_offsets(text: &str) -> Vec<NormChar> {
         let mut end = start + c.len_utf8();
         group.clear();
         group.push(c);
-        // 続く濁点類は同じグループに入れる (合成のため)
+        // 続く結合文字・濁点類は同じグループに入れる (合成のため)
         while let Some(&(ns, nc)) = chars.peek() {
-            if !is_voicing_mark(nc) {
+            if !attaches_to_previous(nc) {
                 break;
             }
             group.push(nc);
@@ -525,6 +534,36 @@ mod tests {
             out.push((t.text.clone(), t.offset_from, t.offset_to));
         }
         out
+    }
+
+    /// **グループ単位の正規化が、丸ごと NFKC したものと一致すること。**
+    ///
+    /// オフセットを保つためにグループ単位で正規化しているので、グループの
+    /// 切り方を間違えると合成が壊れる。かなの濁点だけを特別扱いしていた間は
+    /// `A` + 結合リング が `Å` にならず `A` と結合文字に分かれていた
+    /// (丸ごと NFKC すれば `Å`)。SJIS 由来の本文には結合文字は出ないが、
+    /// **クエリは任意の UTF-8 で来る**ので索引側とクエリ側がずれる。
+    ///
+    /// 既知の差はハングルの字母合成 (LV + T) だけ。starter 同士なので
+    /// グループが分かれる。この資料群では現実的に来ないため許容している。
+    #[test]
+    fn group_normalization_matches_whole_string_nfkc() {
+        for text in [
+            "ＺＭＳファイル",
+            "ﾊﾞｲﾄとﾊﾞｯﾌｧ",
+            "㍿の略記",
+            "A\u{030A}ngstrom",     // 結合リング: 丸ごとなら Å
+            "か\u{3099}き\u{309A}", // 結合濁点・半濁点
+            "e\u{0301}\u{0327}",    // 結合文字が 2 つ (並べ替えが起きる)
+            "音声合成／ＰＣＭ８・ＡＤＰＣＭ",
+        ] {
+            let got: String = normalize_with_offsets(text).iter().map(|n| n.ch).collect();
+            assert_eq!(
+                got,
+                crate::text_norm::nfkc(text),
+                "グループ単位の正規化が丸ごとと一致しない: {text:?}"
+            );
+        }
     }
 
     #[test]
