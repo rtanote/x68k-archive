@@ -15,7 +15,7 @@ use tantivy::{Index, IndexReader, ReloadPolicy, TantivyDocument, Term};
 /// tantivy の既定は 150 文字。日本語 1 文だと短すぎて何の話か分からないので
 /// 少し広げている。一方で広げすぎると MCP のレスポンスが膨らむ
 /// (`archive_search` は既定 20 件返す)。
-const SNIPPET_CHARS: usize = 240;
+pub const SNIPPET_CHARS: usize = 240;
 
 /// 検索オプション。`query` 空 + `ext` 空はエラー、`ext` のみで全件絞り込み可。
 #[derive(Debug, Clone, Default)]
