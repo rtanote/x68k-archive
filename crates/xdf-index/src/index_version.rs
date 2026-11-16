@@ -25,34 +25,66 @@ use tantivy::{Index, IndexWriter};
 /// - `2`: LZH メンバーのパスにディレクトリを含む。
 pub const PATHS_VERSION: u32 = 2;
 
-/// payload に入れる文字列。将来項目が増えてもいいように JSON にしておく。
-pub fn current_payload() -> String {
-    format!(r#"{{"paths":{}}}"#, PATHS_VERSION)
+/// 本文の分割規則 (アナライザ) の版。
+///
+/// - 印が無い (= `0` 扱い): tantivy 既定の `default` アナライザ。日本語は
+///   句読点と空白の間が丸ごと 1 トークンになり、40 バイト (約 14 文字) 以上の
+///   塊は `RemoveLongFilter` のバイト長判定で落ちて**索引に存在しない**。
+///   ASCII の語も日本語に隣接していると一緒に潰れて引けない。
+/// - `1`: 文字 bigram + NFKC ([`crate::analyzer::NGRAM_TOKENIZER`])。
+pub const ANALYZER_VERSION: u32 = 1;
+
+/// 索引に刻まれている版の組。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexVersions {
+    /// 索引内のパスの表し方
+    pub paths: u32,
+    /// 本文の分割規則
+    pub analyzer: u32,
 }
 
-/// 索引から版を読む。印が無ければ `1` 扱い (印を入れる前に作られた索引)。
-pub fn read_paths_version(index: &Index) -> u32 {
-    let metas = match index.load_metas() {
-        Ok(m) => m,
-        Err(_) => return 1,
-    };
-    let payload = match metas.payload.as_deref() {
-        Some(p) => p,
-        None => return 1,
-    };
-    serde_json::from_str::<serde_json::Value>(payload)
+/// payload に入れる文字列。項目が増える前提なので JSON で持つ。
+pub fn current_payload() -> String {
+    serde_json::json!({
+        "paths": PATHS_VERSION,
+        "analyzer": ANALYZER_VERSION,
+    })
+    .to_string()
+}
+
+/// 索引から版を読む。
+///
+/// **欠落時の既定値が軸ごとに違う。** `paths` は印を入れる前から規則が v1
+/// だったので欠落を `1` とみなす。`analyzer` は印と同時に導入したので、
+/// 欠落は `0` = 既定アナライザで作られた索引という意味になる。
+/// ここを揃えてしまうと、古い索引に「新しい」と名乗らせることになり、
+/// 作り直しの案内が出なくなる。
+pub fn read_versions(index: &Index) -> IndexVersions {
+    let parsed = index
+        .load_metas()
         .ok()
-        .and_then(|v| v.get("paths").and_then(|p| p.as_u64()))
-        .map(|n| n as u32)
-        .unwrap_or(1)
+        .and_then(|m| m.payload)
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok());
+    let get = |key: &str, when_missing: u32| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|x| x.as_u64())
+            .map(|n| n as u32)
+            .unwrap_or(when_missing)
+    };
+    IndexVersions {
+        paths: get("paths", 1),
+        analyzer: get("analyzer", 0),
+    }
 }
 
 /// 索引ディレクトリを開いて版を読む。開けなければ `None`。
-pub fn read_paths_version_at(index_dir: &Path) -> Option<u32> {
+pub fn read_versions_at(index_dir: &Path) -> Option<IndexVersions> {
     crate::analyzer::open_in_dir(index_dir)
         .ok()
         .as_ref()
-        .map(read_paths_version)
+        .map(read_versions)
 }
 
 /// 現在の版を刻んで commit する。
@@ -103,14 +135,33 @@ pub const REBUILD_HOWTO: &str = "次で作り直してください (summaries/ �
 /// 作り直しが必要かどうかと、その理由。
 ///
 /// 返すのは「利用者に見せる文」。`None` なら何も言わなくてよい。
-pub fn staleness_note(found: u32) -> Option<String> {
-    if found >= PATHS_VERSION {
+///
+/// **軸が増えても案内は 1 つ。** 理由を列挙して [`REBUILD_HOWTO`] を一度だけ
+/// 付ける。軸ごとに別々の案内を出すと、同じコマンドを 2 回見せることになる。
+pub fn staleness_note(found: IndexVersions) -> Option<String> {
+    let mut reasons: Vec<String> = Vec::new();
+    if found.paths < PATHS_VERSION {
+        reasons.push(format!(
+            "- パスの表し方が v{} です (このビルドは v{PATHS_VERSION})。\n\
+             \x20 LZH 内のサブディレクトリにあるファイルは、パスにディレクトリが\n\
+             \x20 入っていないため曖昧です。",
+            found.paths
+        ));
+    }
+    if found.analyzer < ANALYZER_VERSION {
+        reasons.push(format!(
+            "- 本文の分割規則が v{} です (このビルドは v{ANALYZER_VERSION})。\n\
+             \x20 日本語は句読点の間が丸ごと 1 トークンになっており、14 文字以上の\n\
+             \x20 塊は索引に入っていません。日本語に隣接した ASCII 語も引けません。",
+            found.analyzer
+        ));
+    }
+    if reasons.is_empty() {
         return None;
     }
     Some(format!(
-        "索引は paths v{found} の規則で作られています (このビルドは v{PATHS_VERSION})。\n\
-         LZH 内のサブディレクトリにあるファイルは、パスにディレクトリが入って\n\
-         いないため曖昧です。{REBUILD_HOWTO}"
+        "索引が古い規則で作られています。\n{}\n\n{REBUILD_HOWTO}",
+        reasons.join("\n")
     ))
 }
 
@@ -118,10 +169,19 @@ pub fn staleness_note(found: u32) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// このビルドが刻む版。テストで何度も書くので関数にする。
+    fn current() -> IndexVersions {
+        IndexVersions {
+            paths: PATHS_VERSION,
+            analyzer: ANALYZER_VERSION,
+        }
+    }
+
     #[test]
     fn payload_round_trips() {
         let v: serde_json::Value = serde_json::from_str(&current_payload()).unwrap();
         assert_eq!(v["paths"].as_u64(), Some(PATHS_VERSION as u64));
+        assert_eq!(v["analyzer"].as_u64(), Some(ANALYZER_VERSION as u64));
     }
 
     /// payload を好きな値にした索引を RAM に作る。`None` なら印を書かない
@@ -148,21 +208,28 @@ mod tests {
     #[test]
     fn reads_the_version_we_wrote() {
         let index = ram_index_with_payload(Some(&current_payload()));
-        assert_eq!(read_paths_version(&index), PATHS_VERSION);
+        assert_eq!(read_versions(&index), current());
     }
 
     #[test]
     fn missing_or_broken_payload_means_version_one() {
         // 印が無い索引 = 印を入れる前のもの。壊れた印も同じ扱いにする。
         // 読めないものを「新しい」と誤解すると、作り直しの案内が出なくなる。
-        assert_eq!(read_paths_version(&ram_index_with_payload(None)), 1, "印なし");
+        // **軸ごとに既定値が違う。** paths は印の前から規則が v1 だったので 1、
+        // analyzer は印と同時に導入したので 0 (= 既定アナライザ) になる。
+        let none = read_versions(&ram_index_with_payload(None));
+        assert_eq!(none.paths, 1, "印なしの paths");
+        assert_eq!(none.analyzer, 0, "印なしの analyzer は 0 = 既定アナライザ");
         for p in ["", "{}", "not json", r#"{"paths":"two"}"#, r#"{"other":5}"#] {
-            assert_eq!(
-                read_paths_version(&ram_index_with_payload(Some(p))),
-                1,
-                "payload {p:?} は v1 扱いになること"
-            );
+            let v = read_versions(&ram_index_with_payload(Some(p)));
+            assert_eq!(v.paths, 1, "payload {p:?} の paths");
+            assert_eq!(v.analyzer, 0, "payload {p:?} の analyzer");
         }
+
+        // 片方だけ刻まれている索引 (段階 0 までの索引がこの形)
+        let only_paths = read_versions(&ram_index_with_payload(Some(r#"{"paths":2}"#)));
+        assert_eq!(only_paths.paths, 2);
+        assert_eq!(only_paths.analyzer, 0, "analyzer が無いなら陳腐化扱い");
     }
 
     #[test]
@@ -171,9 +238,9 @@ mod tests {
         let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
         commit_preserving(&index, &mut writer).unwrap();
         assert_eq!(
-            read_paths_version(&index),
-            PATHS_VERSION,
-            "一部だけ書き換える commit で印が消えないこと"
+            read_versions(&index),
+            current(),
+            "一部だけ書き換える commit で印が消えないこと (両方の軸)"
         );
     }
 
@@ -184,7 +251,8 @@ mod tests {
         let index = ram_index_with_payload(None);
         let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
         commit_preserving(&index, &mut writer).unwrap();
-        assert_eq!(read_paths_version(&index), 1);
+        assert_eq!(read_versions(&index).paths, 1);
+        assert_eq!(read_versions(&index).analyzer, 0);
     }
 
     #[test]
@@ -192,15 +260,47 @@ mod tests {
         let index = ram_index_with_payload(None);
         let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
         commit_stamped(&mut writer).unwrap();
-        assert_eq!(read_paths_version(&index), PATHS_VERSION);
+        assert_eq!(read_versions(&index), current());
     }
 
     #[test]
     fn note_only_when_behind() {
-        assert!(staleness_note(PATHS_VERSION).is_none());
-        assert!(staleness_note(PATHS_VERSION + 1).is_none(), "進んでいる索引には何も言わない");
-        let note = staleness_note(1).expect("v1 には注意を出す");
-        assert!(note.contains(REBUILD_HOWTO), "手順は 1 箇所から取ること: {note}");
+        let cur = current();
+        assert!(staleness_note(cur).is_none(), "現行の索引には何も言わない");
+        assert!(
+            staleness_note(IndexVersions {
+                paths: PATHS_VERSION + 1,
+                analyzer: ANALYZER_VERSION + 1
+            })
+            .is_none(),
+            "進んでいる索引には何も言わない"
+        );
+
+        // 片方だけ古い
+        let old_analyzer = IndexVersions { analyzer: 0, ..cur };
+        let note = staleness_note(old_analyzer).expect("アナライザが古ければ言う");
+        assert!(note.contains("分割規則"), "理由を述べること: {note}");
+        assert!(
+            !note.contains("パスの表し方"),
+            "古くない軸には触れないこと: {note}"
+        );
+
+        // **両方古くても案内は 1 回。** 同じコマンドを 2 回見せない。
+        let both = IndexVersions {
+            paths: 1,
+            analyzer: 0,
+        };
+        let note = staleness_note(both).expect("両方古ければ言う");
+        assert!(
+            note.contains("パスの表し方"),
+            "両方の理由を述べること: {note}"
+        );
+        assert!(note.contains("分割規則"), "両方の理由を述べること: {note}");
+        assert_eq!(
+            note.matches(REBUILD_HOWTO).count(),
+            1,
+            "手順は 1 回だけ付けること: {note}"
+        );
     }
 
     /// 手順がそのまま打てる形であることを、文面側で縛る。`build` は

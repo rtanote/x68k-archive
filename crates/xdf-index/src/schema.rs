@@ -11,9 +11,24 @@
 //!
 //! 設計詳細は `docs/additional_spec/design.md`「Tantivy スキーマ拡張」参照。
 
+use crate::analyzer::NGRAM_TOKENIZER;
 use tantivy::schema::{
-    FacetOptions, JsonObjectOptions, Schema, TextFieldIndexing, FAST, INDEXED, STORED, STRING, TEXT,
+    FacetOptions, IndexRecordOption, JsonObjectOptions, Schema, TextFieldIndexing, TextOptions,
+    FAST, INDEXED, STORED, STRING,
 };
+
+/// 日本語を索引できるテキストフィールドの設定。
+///
+/// `WithFreqsAndPositions` は必須。bigram のフレーズ照合が位置に依存しており、
+/// 位置が無いフィールドを検索対象にすると `QueryParser` が
+/// `FieldDoesNotHavePositionsIndexed` で失敗する。
+fn ja_text_options(tokenizer: &str) -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+            .set_tokenizer(tokenizer),
+    )
+}
 
 /// 索引のフィールド集合をまとめた構造体
 pub struct ArchiveSchema {
@@ -27,8 +42,8 @@ pub struct ArchiveSchema {
     pub size: tantivy::schema::Field,
     pub mtime: tantivy::schema::Field,
     pub attr: tantivy::schema::Field,
-    pub body: tantivy::schema::Field,
-    pub body_excerpt: tantivy::schema::Field,
+    /// 本文。文字 bigram で索引し、**STORED** で本文そのものも持つ
+    pub body_ngram: tantivy::schema::Field,
 
     // --- Phase 5b: 構造化メタデータ ---
     /// 例: "music" / "gallery" / "tool" / "" (= 構造化レコードでないファイル本文)
@@ -59,14 +74,28 @@ impl ArchiveSchema {
         let image_id = sb.add_text_field("image_id", STRING | STORED);
         let partition = sb.add_u64_field("partition", INDEXED | STORED | FAST);
         let file_path = sb.add_text_field("file_path", STRING | STORED);
-        let file_name = sb.add_text_field("file_name", TEXT | STORED);
+        // 半角カナのファイル名が多いので、NFKC を本文と揃えないと
+        // クエリ側だけ正規化されて「今より引きにくくなる」。
+        let file_name =
+            sb.add_text_field("file_name", ja_text_options(NGRAM_TOKENIZER).set_stored());
         let ext = sb.add_text_field("ext", STRING | STORED | FAST);
         let size = sb.add_u64_field("size", INDEXED | STORED | FAST);
         let mtime = sb.add_i64_field("mtime", INDEXED | STORED | FAST);
         let attr = sb.add_text_field("attr", STRING | STORED);
-        // 本文 (テキスト系のみ)
-        let body = sb.add_text_field("body", TEXT);
-        let body_excerpt = sb.add_text_field("body_excerpt", STORED);
+        // 本文 (テキスト系のみ)。旧 `body` は既定アナライザで日本語を取りこぼして
+        // いたので、名前を変えて別フィールドにしてある。読み出し側は名前で引くため、
+        // 旧索引は `body` に落ちて従来どおり動く (searcher.rs の ReadFields)。
+        // **STORED にしている理由**は 3 つ。
+        //   1. アナライザを変えるたびにアーカイブ全体を読み直す必要がなくなる
+        //      (索引自身から再索引できる)。再構築の回数を削るより、再構築を安くする
+        //   2. ヒット箇所まわりの抜粋を出せる。旧 `body_excerpt` はファイル先頭
+        //      2048 バイト固定で、マッチ位置とは無関係だった
+        //   3. 精度の自動評価ができる (ヒットが本当にその文字列を含むかの照合)
+        // 実測コスト: 約 1 万ファイルの索引で 1.8 倍。ビルド時間と検索時間は変わらない。
+        // 旧 `body_excerpt` は本文の先頭 2048 バイトそのものなので**完全な重複**になり、
+        // 廃止した。抜粋は読み出し時に本文から切り出す (searcher.rs)。
+        let body_ngram =
+            sb.add_text_field("body_ngram", ja_text_options(NGRAM_TOKENIZER).set_stored());
 
         // --- 構造化メタデータ (Phase 5b) ---
         let category = sb.add_text_field("category", STRING | STORED | FAST);
@@ -76,13 +105,14 @@ impl ArchiveSchema {
         let unique_id = sb.add_text_field("unique_id", STRING | STORED);
         let schema_plugin = sb.add_text_field("schema_plugin", STRING | STORED | FAST);
         let schema_version = sb.add_u64_field("schema_version", STORED | FAST);
-        // payload: JSON。デフォルトトークナイザで indexed (TEXT) かつ stored
+        // payload: JSON。本文と同じアナライザで indexed かつ stored。
+        // 40 バイトを超える曲名が既定アナライザでは同じバグで落ちていた。
         let payload_opts = JsonObjectOptions::default()
             .set_stored()
             .set_indexing_options(
                 TextFieldIndexing::default()
                     .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions)
-                    .set_tokenizer("default"),
+                    .set_tokenizer(NGRAM_TOKENIZER),
             );
         let payload = sb.add_json_field("payload", payload_opts);
         let location_facet = sb.add_facet_field("location_facet", FacetOptions::default());
@@ -98,8 +128,7 @@ impl ArchiveSchema {
             size,
             mtime,
             attr,
-            body,
-            body_excerpt,
+            body_ngram,
             category,
             issue_no,
             issue_kind,
@@ -145,8 +174,11 @@ mod tests {
         let _ = s.schema.get_field("image_id").unwrap();
         let _ = s.schema.get_field("partition").unwrap();
         let _ = s.schema.get_field("file_path").unwrap();
-        let _ = s.schema.get_field("body").unwrap();
-        let _ = s.schema.get_field("body_excerpt").unwrap();
+        let _ = s.schema.get_field("body_ngram").unwrap();
+        assert!(
+            s.schema.get_field("body_excerpt").is_err(),
+            "body_excerpt は廃止した (本文が STORED なので完全な重複だった)"
+        );
         // 構造化フィールド (Phase 5b)
         let _ = s.schema.get_field("category").unwrap();
         let _ = s.schema.get_field("issue_no").unwrap();

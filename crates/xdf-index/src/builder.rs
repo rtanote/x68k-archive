@@ -335,11 +335,8 @@ fn index_one_file(
     let ext_upper = entry.ext.to_ascii_uppercase();
     let attr = attr_str(entry.attr);
 
-    let body_pair = extract_text_body(fs, entry);
-    let (body, excerpt) = match &body_pair {
-        Some((b, e)) => (Some(b.as_str()), Some(e.as_str())),
-        None => (None, None),
-    };
+    let body_text = extract_text_body(fs, entry);
+    let body = body_text.as_deref();
     let doc = build_document(
         schema,
         DocFields {
@@ -353,7 +350,6 @@ fn index_one_file(
             mtime_unix: mtime_to_unix(entry),
             attr: &attr,
             body,
-            excerpt,
         },
     );
     writer.add_document(doc)?;

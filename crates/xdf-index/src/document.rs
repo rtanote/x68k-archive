@@ -7,7 +7,10 @@ use xdf_fs::direntry::{Attr, DirEntry};
 use xdf_fs::export::entry_to_filetime;
 use xdf_fs::fs::Filesystem;
 
-/// 本文スニペット (body_excerpt) の最大バイト数
+/// 検索結果に出す抜粋の最大バイト数。
+///
+/// 以前は `body_excerpt` として索引に持っていたが、本文が STORED に
+/// なったので**読み出し時に切り出す**ようにした (searcher.rs)。
 pub const EXCERPT_BYTES: usize = 2048;
 
 /// SJIS バイト列を UTF-8 に変換 (lossy)
@@ -54,15 +57,13 @@ pub fn mtime_to_unix(entry: &DirEntry) -> i64 {
 pub fn extract_text_body(
     fs: &Filesystem,
     entry: &DirEntry,
-) -> Option<(String, String)> {
+) -> Option<String> {
     let ext_upper = entry.ext.to_ascii_uppercase();
     if !is_text_extension(&ext_upper) {
         return None;
     }
     let bytes = fs.read_file(entry).ok()?;
-    let text = decode_sjis_lossy(&bytes);
-    let excerpt = make_excerpt(&text, EXCERPT_BYTES);
-    Some((text, excerpt))
+    Some(decode_sjis_lossy(&bytes))
 }
 
 /// tantivy ドキュメントの生フィールド (LZH メンバーのような DirEntry を持たないものも統一して扱う)
@@ -79,35 +80,6 @@ pub struct DocFields<'a> {
     /// 7 文字の属性文字列 (例: "----A--")
     pub attr: &'a str,
     pub body: Option<&'a str>,
-    pub excerpt: Option<&'a str>,
-}
-
-/// `DirEntry` ベースの便利コンストラクタ (XDF/HDS/HDF 内部のファイル用)
-pub fn doc_fields_from_entry<'a>(
-    image_path: &'a str,
-    image_id: &'a str,
-    partition: usize,
-    file_path: &'a str,
-    entry: &'a DirEntry,
-    cached_name: &'a str,
-    cached_ext: &'a str,
-    cached_attr: &'a str,
-    body: Option<&'a str>,
-    excerpt: Option<&'a str>,
-) -> DocFields<'a> {
-    DocFields {
-        image_path,
-        image_id,
-        partition,
-        file_path,
-        file_name: cached_name,
-        ext: cached_ext,
-        size: entry.size as u64,
-        mtime_unix: mtime_to_unix(entry),
-        attr: cached_attr,
-        body,
-        excerpt,
-    }
 }
 
 /// 1 ファイル = 1 tantivy ドキュメント
@@ -123,10 +95,8 @@ pub fn build_document(schema: &ArchiveSchema, fields: DocFields<'_>) -> TantivyD
     doc.add_i64(schema.mtime, fields.mtime_unix);
     doc.add_text(schema.attr, fields.attr);
     if let Some(b) = fields.body {
-        doc.add_text(schema.body, b);
-    }
-    if let Some(e) = fields.excerpt {
-        doc.add_text(schema.body_excerpt, e);
+        // STORED なので、この 1 回で索引用のトークンと本文そのものの両方が入る。
+        doc.add_text(schema.body_ngram, b);
     }
     doc
 }

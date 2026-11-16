@@ -388,8 +388,14 @@ impl XdfMcpServer {
     #[tool(
         description = "Full-text search across all indexed X68000 disk images. \
                        Returns hits with image_path/partition/file_path citation and an excerpt. \
+                       Japanese is indexed as overlapping 2-character units, so any substring \
+                       of 2+ characters matches and word order is preserved \
+                       (searching 音声合成 will not match 合成音声). \
+                       A single CJK character alone will NOT match -- use 2+ characters. \
+                       Full-width and half-width forms are normalised, so ＺＭＳ and ZMS, \
+                       or ｻﾝﾌﾟﾙ and サンプル, are interchangeable. \
                        Optional `ext` array filters by file extension (e.g. [\"ZMS\",\"DOC\"]) \
-                       — useful for browsing source code or MML data without a specific keyword."
+                       -- useful for browsing source code or MML data without a specific keyword."
     )]
     async fn archive_search(
         &self,
@@ -1156,7 +1162,7 @@ async fn main() -> Result<()> {
     // 索引の作り方の版を見て、作り直しが要るなら起動時に言う。公開リポジトリ
     // なので、バイナリだけ更新した利用者がここで気づけるようにしておく。
     // 読めないときは黙る（索引が開けているなら致命的ではない）。
-    if let Some(v) = xdf_index::index_version::read_paths_version_at(&args.index) {
+    if let Some(v) = xdf_index::index_version::read_versions_at(&args.index) {
         if let Some(note) = xdf_index::index_version::staleness_note(v) {
             eprintln!("xdf-mcp: warning: {note}");
         }
