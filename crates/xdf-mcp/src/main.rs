@@ -387,7 +387,9 @@ impl XdfMcpServer {
 
     #[tool(
         description = "Full-text search across all indexed X68000 disk images. \
-                       Returns hits with image_path/partition/file_path citation and an excerpt. \
+                       Returns hits with image_path/partition/file_path citation and an excerpt \
+                       taken from around the match (not the head of the file), so the excerpt \
+                       is usually enough to decide whether to call archive_read. \
                        Japanese is indexed as overlapping 2-character units, so any substring \
                        of 2+ characters matches and word order is preserved \
                        (searching 音声合成 will not match 合成音声). \

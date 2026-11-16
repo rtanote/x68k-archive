@@ -267,8 +267,17 @@ fn main() -> Result<()> {
                     h.score, h.image_path, h.partition, h.file_path, h.size, h.ext
                 );
                 if !h.excerpt.is_empty() {
-                    let first_line = h.excerpt.lines().next().unwrap_or("");
-                    let preview: String = first_line.chars().take(100).collect();
+                    // 抜粋はヒット箇所まわりを切り出したもので、**行の途中から
+                    // 始まることも複数行にまたがることもある**。以前は最初の 1 行を
+                    // そのまま出していたが、それだと `めて` のような短い断片や
+                    // 飾り罫線だけが出て役に立たなかった。空白類を 1 個に畳んで
+                    // 1 行にまとめる。
+                    let flat: String = h
+                        .excerpt
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let preview: String = flat.chars().take(110).collect();
                     println!("    │ {}", preview);
                 }
             }
