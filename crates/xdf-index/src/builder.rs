@@ -3,6 +3,7 @@
 use crate::document::{
     attr_str, build_document, extract_text_body, mtime_to_unix, DocFields,
 };
+use crate::analyzer;
 use crate::lzh::{index_lzh_bytes, LzhOpts};
 use crate::schema::ArchiveSchema;
 use anyhow::{Context, Result};
@@ -62,11 +63,11 @@ pub fn build_index<A: AsRef<Path>, I: AsRef<Path>>(
     let index = if opts.fresh {
         // 既存索引を消して新規作成
         clear_index_dir(index_dir)?;
-        Index::create_in_dir(index_dir, schema.schema.clone())?
+        analyzer::create_in_dir(index_dir, schema.schema.clone())?
     } else if index_dir.join("meta.json").exists() {
-        Index::open_in_dir(index_dir)?
+        analyzer::open_in_dir(index_dir)?
     } else {
-        Index::create_in_dir(index_dir, schema.schema.clone())?
+        analyzer::create_in_dir(index_dir, schema.schema.clone())?
     };
 
     let existing_ids = if opts.fresh {
